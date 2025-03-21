@@ -158,7 +158,8 @@ class CombinedDataset(Dataset):
         ext = os.path.splitext(self.media_files[idx])[1].lower()
         if ext in IMAGE_TYPES:
             image = Image.open(self.media_files[idx]).convert('RGB')
-            pixels = torch.as_tensor(np.array(image)).unsqueeze(0) # FHWC
+            # pixels = torch.as_tensor(np.array(image)).unsqueeze(0) # FHWC
+            pixels = torch.as_tensor(np.array(image)).permute(2, 0, 1).unsqueeze(1) # # (H, W, C) -> (C, H, W) -> (C, 1, H, W)
             buckets = self.get_ar_buckets(pixels.shape[2], pixels.shape[1])
             width, height = random.choice(buckets)
         else:
@@ -175,7 +176,7 @@ class CombinedDataset(Dataset):
             # sample a clip from the video based on frame stride and length
             seg_len = min(stride * max_frames, orig_frames)
             start_frame = random.randint(0, orig_frames - seg_len)
-            pixels = vr[start_frame : start_frame+seg_len : stride]
+            pixels = vr[start_frame : start_frame+seg_len : stride] # FHWC
             max_frames = ((pixels.shape[0] - 1) // 4) * 4 + 1
             pixels = pixels[:max_frames] # clip frames to match vae
         
@@ -199,7 +200,8 @@ class CombinedDataset(Dataset):
             v2.Resize(size=(height, width)),
         ])
         
-        pixels = pixels.movedim(3, 1).unsqueeze(0).contiguous() # FHWC -> FCHW -> BFCHW
+        # pixels = pixels.movedim(3, 1).unsqueeze(0).contiguous() # FHWC -> FCHW -> BFCHW
+        pixels = pixels.permute(3, 0, 1, 2).contiguous() # CFHW
         pixels = transform(pixels) * 2 - 1
         pixels = torch.clamp(torch.nan_to_num(pixels), min=-1, max=1)
         
@@ -286,6 +288,30 @@ def parse_args():
         description = "HunyuanVideo training script",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         )
+    parser.add_argument(
+        "--control_lora",
+        action="store_true",
+        help="Train lora as control lora (extra input channels)",
+        )
+    parser.add_argument(
+        "--control_preprocess",
+        type=str,
+        default="depth",
+        choices=["depth"],
+        help="Preprocess to apply, if not loading control video",
+        )
+    parser.add_argument(
+        "--control_inject_noise",
+        type=float,
+        default=0.0,
+        help="Add noise to the control latents, at a random strength up to this amount",
+        )
+    parser.add_argument(
+        "--input_lr_scale",
+        type=float,
+        default=1.0,
+        help="Multiplier to learning rate for the input layer if training control lora",
+    )
     parser.add_argument(
         "--download_model",
         action = "store_true",
@@ -517,11 +543,12 @@ def main(args):
         json.dump(args.__dict__, f, indent=4)
     
     def collate_batch(batch):
-        pixels = torch.cat([sample["pixels"] for sample in batch], dim=0)
+        pixels = torch.stack([sample["pixels"] for sample in batch], dim=0) # BFCHW
         clip_embed = torch.cat([sample["embedding_dict"]["clip_embed"] for sample in batch], dim=0)
         llama_embed = torch.cat([sample["embedding_dict"]["llama_embed"] for sample in batch], dim=0)
         llama_mask = torch.cat([sample["embedding_dict"]["llama_mask"] for sample in batch], dim=0)
         return pixels, clip_embed, llama_embed, llama_mask
+    
     
     train_dataset = os.path.join(args.dataset, "train")
     if not os.path.exists(train_dataset):
@@ -616,29 +643,66 @@ def main(args):
         diffusion_model.requires_grad_(False)
         diffusion_model.enable_gradient_checkpointing()
         torch.cuda.empty_cache()
+
+        if args.control_lora:
+            with torch.no_grad():
+                in_cls = diffusion_model.in_proj.__class__ # nn.Conv3d
+                old_in_dim = diffusion_model.config.in_channels # Get from config: 32
+                new_in_dim = old_in_dim * 2
+
+                new_in = in_cls(
+                    new_in_dim,
+                    diffusion_model.in_proj.out_channels,
+                    diffusion_model.in_proj.kernel_size,
+                    diffusion_model.in_proj.stride,
+                    diffusion_model.in_proj.padding,
+                ).to(device=device, dtype=torch.bfloat16)
+
+                new_in.weight.zero_()
+                new_in.bias.zero_()
+
+                new_in.weight[:, :old_in_dim].copy_(diffusion_model.in_proj.weight)
+                new_in.bias.copy_(diffusion_model.in_proj.bias)
+
+                diffusion_model.in_proj = new_in
+                diffusion_model.register_to_config(in_channels=new_in_dim) # CRUCIAL: Update config!
     
     with timer("added LoRA in"):
         lora_params = []
+
+        # Conditionally target input projection layer for control LoRA
+        if args.control_lora:
+            lora_params.append("in_proj")
+
+        # Target all attention blocks (original implementation)
         attn_blocks = ["transformer_blocks", "single_transformer_blocks"]
         lora_keys = ["to_k", "to_q", "to_v", "to_out.0", "proj_mlp"] # mmdit img attention + single blocks attention
         # lora_keys += ["add_q_proj", "add_k_proj", "add_v_proj", "to_add_out"] # mmdit text attention
-        # lora_keys += ["ff.net", "proj_out"] # mmdit img mlp + single blocks mlp
+        # lora_keys += ["ff.net", "proj_out"] # mmdit img mlp + single blocks mlp; for CONTROL LORA, could pontentially improve control fidelity
         # lora_keys += ["ff_context.net"] # mmdit text mlp
+
+        # Find all parameters that match our criteria
         for name, param in diffusion_model.named_parameters():
-            name = name.replace(".weight", "").replace(".bias", "")
+            clean_name = name.replace(".weight", "").replace(".bias", "")
             for block in attn_blocks:
-                if name.startswith(block):
+                if clean_name.startswith(block):
                     for key in lora_keys:
-                        if key in name:
-                            lora_params.append(name)
+                        if key in clean_name:
+                            lora_params.append(clean_name)
         
+        # Print debug info to verify targeting
+        print(f"Found {len(lora_params)} target modules for LoRA")
+        if len(lora_params) > 0:
+            print(f"Example targets: {lora_params[:3]}...")
+
         lora_config = LoraConfig(
             r = args.lora_rank,
             lora_alpha = args.lora_alpha or args.lora_rank,
             init_lora_weights = "gaussian",
             target_modules = lora_params,
         )
-        diffusion_model.add_adapter(lora_config)
+
+        diffusion_model.add_adapter(lora_config, adapter_name="default") # CHECK: Is this correct?
         
         if args.init_lora is not None:
             loaded_lora_sd = load_file(args.init_lora)
@@ -658,7 +722,15 @@ def main(args):
     
     # Instead of having just one optimizer, we will have a dict of optimizers
     # for every parameter so we could reference them in our hook.
-    optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=args.learning_rate) for p in lora_parameters}
+    # optimizer_dict = {p: bnb.optim.AdamW8bit([p], lr=args.learning_rate) for p in lora_parameters}
+    optimizer_dict = {}
+    for name, param in diffusion_model.named_parameters():
+        if param.requires_grad:
+            if "in_proj" in name and args.control_lora:
+                lr = args.learning_rate * args.input_lr_scale
+            else:
+                lr = args.learning_rate
+            optimizer_dict[param] = bnb.optim.AdamW8bit([param], lr=lr)
     
     # Define our hook, which will call the optimizer step() and zero_grad()
     def optimizer_hook(parameter) -> None:
@@ -673,40 +745,165 @@ def main(args):
         from noise_warp.GetWarpedNoiseFromVideo import GetWarpedNoiseFromVideo
         get_warped_noise = GetWarpedNoiseFromVideo(raft_size="large", device=device, dtype=torch.float32)
     
+    # Load Depth Anything v2
+    if args.control_lora and args.control_preprocess == "depth":
+        if not os.path.exists("./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth"):
+            print("depth model not found, downloading to ./model/Depth-Anything-V2-Small")
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_type="model",
+                repo_id = "depth-anything/Depth-Anything-V2-Small",
+                local_dir = "./models/Depth-Anything-V2-Small",
+                allow_patterns = "*.pth",
+            )
+        from utils.depth_anything_v2.dpt import DepthAnythingV2
+        depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
+        depth_model.load_state_dict(torch.load("./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth", map_location='cpu', weights_only=True))
+        depth_model = depth_model.to(device)
+        depth_model.requires_grad_(False)
+        depth_model.eval()
+
+    
+    def preprocess_control(pixels):
+        if args.control_preprocess == "depth":
+            B, C, F, H, W = pixels.shape
+            depth_tensor = torch.zeros((B, F, H, W), device=pixels.device)
+            
+            # Process each batch item and frame separately
+            for b in range(B):
+                for f in range(F):
+                    # Extract single frame and convert to numpy for depth model
+                    frame = pixels[b, :, f].cpu().float() * 0.5 + 0.5  # Normalize to 0-1
+                    frame = frame.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
+                    
+                    # Get depth map
+                    depth = depth_model.infer_image(frame)
+                    
+                    # Verify depth map dimensions match original frame
+                    if depth.shape != (H, W):
+                        # Resize depth map to match input frame dimensions
+                        from PIL import Image
+                        depth_pil = Image.fromarray(depth)
+                        depth_pil = depth_pil.resize((W, H), Image.Resampling.BICUBIC)
+                        depth = np.array(depth_pil)
+                    
+                    # Normalize depth to -1 to 1 range
+                    depth_min, depth_max = depth.min(), depth.max()
+                    if depth_max > depth_min:  # Avoid division by zero
+                        depth = (depth - depth_min) / (depth_max - depth_min)
+                    depth = depth * 2 - 1  # Scale to -1 to 1
+                    
+                    # Store in our result tensor
+                    depth_tensor[b, f] = torch.tensor(depth, device=pixels.device)
+            
+            # Add channel dimension and convert to model dtype
+            depth_tensor = depth_tensor.unsqueeze(1)  # (B, F, H, W) -> (B, 1, F, H, W)
+            control = depth_tensor.to(dtype=torch.bfloat16)
+            
+            # Add assertions to verify shape compatibility
+            assert control.shape[0] == pixels.shape[0], f"Batch dimension mismatch: {control.shape[0]} vs {pixels.shape[0]}"
+            assert control.shape[2] == pixels.shape[2], f"Frame dimension mismatch: {control.shape[2]} vs {pixels.shape[2]}"
+            assert control.shape[3] == pixels.shape[3], f"Height dimension mismatch: {control.shape[3]} vs {pixels.shape[3]}"
+            assert control.shape[4] == pixels.shape[4], f"Width dimension mismatch: {control.shape[4]} vs {pixels.shape[4]}"
+            
+            # Verify values are in proper range
+            assert not torch.isnan(control).any(), "NaN values detected in control tensor"
+            assert ((control >= -1.0) & (control <= 1.0)).all(), f"Control values out of range [-1,1]: min={control.min().item()}, max={control.max().item()}"
+        else:
+            raise NotImplementedError(f"{args.control_preprocess}")
+
+        return control
+
+
     def prepare_conditions(batch):
         pixels, clip_embed, llama_embed, llama_mask = batch
-        pixels = pixels.movedim(1, 2).to(device=vae.device, dtype=vae.dtype) # BFCHW -> BCFHW
+        pixels = pixels.to(device=vae.device, dtype=vae.dtype) # BCFHW
         latents = vae.encode(pixels).latent_dist.sample() * vae.config.scaling_factor
+
+        # log input shapes for debugging
+        print(f"DEBUG: Input pixels shape: {pixels.shape}")
+        print(f"DEBUG: Encoded latents shape: {latents.shape}")
         
+        if args.control_lora:
+            # Get depth control map (B, 1, F, H, W)
+            control = preprocess_control(pixels)
+            print(f"DEBUG: Control shape: {control.shape}")
+            
+            # Validate control shape before encoding
+            assert control.shape[2:] == pixels.shape[2:], f"Control shape {control.shape[2:]} doesn't match input shape {pixels.shape[2:]}"
+            
+            try:
+                # Encode control to latent space
+                control_latents = vae.encode(control).latent_dist.sample() * vae.config.scaling_factor
+                print(f"DEBUG: Control latents shape: {control_latents.shape}")
+                
+                # Ensure latent shapes match
+                assert control_latents.shape == latents.shape, f"Shape mismatch: control latents {control_latents.shape} vs. latents {latents.shape}"
+                
+                # Optionally add noise to control latents
+                if args.control_inject_noise > 0:
+                    inject_strength = torch.rand(latents.shape[0], device=latents.device) * args.control_inject_noise
+                    control_latents += torch.randn_like(control_latents) * inject_strength[:, None, None, None, None]
+            except RuntimeError as e:
+                print(f"Error encoding control: {e}")
+                print(f"Input shape: {control.shape}, Original input shape: {pixels.shape}")
+                raise
+
+        # iamge-to-video conditioning (skyreels)
         if args.skyreels_i2v:
             image_cond_latents = torch.zeros_like(latents)
             image_latents = vae.encode(pixels[:, :, 0].unsqueeze(2)).latent_dist.sample() * vae.config.scaling_factor
             image_cond_latents[:, :, 0] = image_latents[:, :, 0]
             del image_latents
         
-        t_writer.add_scalar("debug/context_len", latents.shape[-3] * (latents.shape[-2] / 2) * (latents.shape[-1] / 2), global_step)
+        # logging for debugging
+        # t_writer.add_scalar("debug/context_len", latents.shape[-3] * (latents.shape[-2] / 2) * (latents.shape[-1] / 2), global_step)
+        t_writer.add_scalar("debug/context_len", latents.shape[2] * latents.shape[3] * latents.shape[4], global_step)
         t_writer.add_scalar("debug/width", pixels.shape[-1], global_step)
         t_writer.add_scalar("debug/height", pixels.shape[-2], global_step)
         t_writer.add_scalar("debug/frames", pixels.shape[-3], global_step)
         
+        # Noise generation
+        # if args.warped_noise:
+        #     noise = get_warped_noise(
+        #         pixels.movedim(2, 1)[0], # BCFHW -> BFCHW -> FCHW
+        #         degradation = torch.rand(1).item(),
+        #         noise_channels = 16,
+        #         target_latent_count = latents.shape[2],
+        #     ).movedim(0, 1).unsqueeze(0).to(latents) # FCHW -> CFHW -> BCFHW
+        # else:
+        #     noise = torch.randn_like(latents)
         if args.warped_noise:
             noise = get_warped_noise(
-                pixels.movedim(2, 1)[0], # BCFHW -> BFCHW -> FCHW
-                degradation = torch.rand(1).item(),
-                noise_channels = 16,
-                target_latent_count = latents.shape[2],
-            ).movedim(0, 1).unsqueeze(0).to(latents) # FCHW -> CFHW -> BCFHW
+                pixels.movedim(2, 1),  # BCFHW -> BFCHW
+                degradation=torch.rand(1).item(),
+                noise_channels=16,
+                target_latent_count=latents.shape[2],
+            ).movedim(1, 2).to(latents)  # BFCHW -> BCFHW
         else:
             noise = torch.randn_like(latents)
         
-        # TODO: add sd3/flux timestep density sampling?
-        sigma = torch.rand(latents.shape[0])
+        # timestep and noise input preparation
+        sigma = torch.rand(latents.shape[0], device=latents.device)
         timesteps = torch.round(sigma * 1000).long()
-        sigma = sigma[:, None, None, None, None].to(latents)
+        sigma = sigma[:, None, None, None, None]
         noisy_model_input = (noise * sigma) + (latents * (1 - sigma))
         
+        # concatenate additional inputs along the channel dimension (dim=1)
+        model_inputs = [noisy_model_input]
         if args.skyreels_i2v:
-            noisy_model_input = torch.cat([noisy_model_input, image_cond_latents], dim=1)
+            model_inputs.append(image_cond_latents)
+        if args.control_lora:
+            model_inputs.append(control_latents)
+
+        # Concatenate all inputs
+        noisy_model_input = torch.cat(model_inputs, dim=1)
+        print(f"DEBUG: Final model input shape: {noisy_model_input.shape}")
+
+        # Add assertions to catch shape problems early
+        assert noisy_model_input.ndim == 5, f"Model input should be 5D but got shape {noisy_model_input.shape}"
+        if args.control_lora:
+            assert control_latents.shape[2:] == latents.shape[2:], f"Control latents spatial dims mismatch: {control_latents.shape[2:]} vs {latents.shape[2:]}"
         
         guidance_scale = 1.0
         guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=torch.float32, device=device) * 1000.0
@@ -722,16 +919,20 @@ def main(args):
         }
     
     def predict_loss(conditions):
-        pred = diffusion_model(
-            hidden_states          = conditions["noisy_model_input"],
-            timestep               = conditions["timesteps"],
-            encoder_hidden_states  = conditions["llama_embed"],
-            encoder_attention_mask = conditions["llama_mask"],
-            pooled_projections     = conditions["clip_embed"],
-            guidance               = conditions["guidance"],
-            return_dict = False,
-        )[0]
-        return F.mse_loss(pred.float(), conditions["target"].float())
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred = diffusion_model(
+                hidden_states          = conditions["noisy_model_input"], # Tensor: (B, C', F', H', W')
+                timestep               = conditions["timesteps"], # Tensor: (B,)
+                encoder_hidden_states  = conditions["llama_embed"],
+                encoder_attention_mask = conditions["llama_mask"],
+                pooled_projections     = conditions["clip_embed"],
+                guidance               = conditions["guidance"], # default to 1.0, common for training without CFG
+                return_dict = False,
+            )[0]
+
+        loss = F.mse_loss(pred.float(), conditions["target"].float())
+        assert not torch.isnan(pred).any(), "NaN detected in predictions" # check for NaN for robustness
+        return loss
     
     gc.collect()
     torch.cuda.empty_cache()
