@@ -158,8 +158,8 @@ class CombinedDataset(Dataset):
         ext = os.path.splitext(self.media_files[idx])[1].lower()
         if ext in IMAGE_TYPES:
             image = Image.open(self.media_files[idx]).convert('RGB')
-            # pixels = torch.as_tensor(np.array(image)).unsqueeze(0) # FHWC
-            pixels = torch.as_tensor(np.array(image)).permute(2, 0, 1).unsqueeze(1) # # (H, W, C) -> (C, H, W) -> (C, 1, H, W)
+            pixels = torch.as_tensor(np.array(image)).unsqueeze(0) # FHWC
+            # pixels = torch.as_tensor(np.array(image)).permute(2, 0, 1).unsqueeze(1) # # (H, W, C) -> (C, H, W) -> (C, 1, H, W)
             buckets = self.get_ar_buckets(pixels.shape[2], pixels.shape[1])
             width, height = random.choice(buckets)
         else:
@@ -772,7 +772,7 @@ def main(args):
             # Process each batch item and frame separately
             for b in range(B):
                 for f in range(F):
-                    # Extract single frame and convert to numpy for depth model
+                    # Extract single frame, normalize to 0-1, and convert to numpy (H, W, C)
                     frame = pixels[b, :, f].cpu().float() * 0.5 + 0.5  # Normalize to 0-1
                     frame = frame.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
                     
@@ -780,12 +780,12 @@ def main(args):
                     depth = depth_model.infer_image(frame)
                     
                     # Verify depth map dimensions match original frame
+                    # Resize depth map to match input frame dimensions
+                    from torchvision.transforms.functional import resize
                     if depth.shape != (H, W):
-                        # Resize depth map to match input frame dimensions
-                        from PIL import Image
-                        depth_pil = Image.fromarray(depth)
-                        depth_pil = depth_pil.resize((W, H), Image.Resampling.BICUBIC)
-                        depth = np.array(depth_pil)
+                        depth_tensor = torch.tensor(depth, device=pixels.device).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                        depth_tensor = resize(depth_tensor, (H, W), interpolation=InterpolationMode.BICUBIC)
+                        depth = depth_tensor.squeeze().cpu().numpy()
                     
                     # Normalize depth to -1 to 1 range
                     depth_min, depth_max = depth.min(), depth.max()
@@ -796,23 +796,28 @@ def main(args):
                     # Store in our result tensor
                     depth_tensor[b, f] = torch.tensor(depth, device=pixels.device)
             
-            # Add channel dimension and convert to model dtype
-            depth_tensor = depth_tensor.unsqueeze(1)  # (B, F, H, W) -> (B, 1, F, H, W)
-            control = depth_tensor.to(dtype=torch.bfloat16)
-            
+            # Add channel dimension: (B, F, H, W) -> (B, 1, F, H, W)
+            depth_tensor = depth_tensor.unsqueeze(1)
+            # control = depth_tensor.to(dtype=torch.bfloat16) # potential vae error
+            # Replicate teh single channel to 3 channels to match the VAE's expected input shape
+            control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=torch.bfloat16)
+
             # Add assertions to verify shape compatibility
             assert control.shape[0] == pixels.shape[0], f"Batch dimension mismatch: {control.shape[0]} vs {pixels.shape[0]}"
             assert control.shape[2] == pixels.shape[2], f"Frame dimension mismatch: {control.shape[2]} vs {pixels.shape[2]}"
             assert control.shape[3] == pixels.shape[3], f"Height dimension mismatch: {control.shape[3]} vs {pixels.shape[3]}"
             assert control.shape[4] == pixels.shape[4], f"Width dimension mismatch: {control.shape[4]} vs {pixels.shape[4]}"
             
+            # verify the channel dimension is now 3
+            assert control.shape[1] == 3, f"Exepcted control channels to be 3, got {control.shape[1]}"
+            
             # Verify values are in proper range
             assert not torch.isnan(control).any(), "NaN values detected in control tensor"
             assert ((control >= -1.0) & (control <= 1.0)).all(), f"Control values out of range [-1,1]: min={control.min().item()}, max={control.max().item()}"
+            
+            return control
         else:
             raise NotImplementedError(f"{args.control_preprocess}")
-
-        return control
 
 
     def prepare_conditions(batch):
