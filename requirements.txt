@@ -9,3 +9,5 @@ imageio
 imageio-ffmpeg
 einops
 huggingface-hub
+inquirer
+opencv-python
