@@ -4,6 +4,7 @@ from collections import Counter
 from fractions import Fraction
 import glob
 from pathlib import Path
+import argparse
 
 def get_video_dimensions(video_path):
     """Get the dimensions of a video file using OpenCV."""
@@ -109,4 +110,9 @@ def analyze_videos(base_dir='data'):
     print(f"\nTotal videos analyzed: {total_videos}")
 
 if __name__ == "__main__":
-    analyze_videos() 
+    parser = argparse.ArgumentParser(description='Analyze video dimensions and aspect ratios in a dataset.')
+    parser.add_argument('--base_dir', type=str, default='data', 
+                        help='Base directory containing train, test, and val folders (default: data)')
+    args = parser.parse_args()
+    
+    analyze_videos(args.base_dir) 
