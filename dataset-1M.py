@@ -4,51 +4,62 @@ import pandas as pd
 import random
 import shutil
 import argparse
-import json
+import cv2
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 def check_video_resolution(video_path):
     """
-    Check if a video has at least 720p resolution.
+    Check if a video has at least 720p resolution using OpenCV.
     
     Args:
         video_path: Path to the video file
         
     Returns:
         tuple: (is_hd, width, height) where is_hd is True if resolution is at least 720p
+              or (False, 0, 0) if video is corrupted
     """
     try:
-        # Use ffprobe to get video resolution
-        cmd = [
-            'ffprobe', 
-            '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'json',
-            video_path
-        ]
+        # Open the video file
+        cap = cv2.VideoCapture(video_path)
         
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        video_info = json.loads(result.stdout)
+        # Check if video opened successfully
+        if not cap.isOpened():
+            print(f"Could not open video file: {video_path}")
+            return False, 0, 0
         
-        if 'streams' in video_info and len(video_info['streams']) > 0:
-            width = int(video_info['streams'][0].get('width', 0))
-            height = int(video_info['streams'][0].get('height', 0))
-            
-            # Check if height is at least 720 pixels
-            is_hd = height >= 720
-            
-            return is_hd, width, height
-        else:
-            print(f"Could not determine resolution for {video_path}")
+        # Get width and height
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Try to read the first frame to verify the video can be decoded
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Could not decode the first frame of {video_path}")
+            cap.release()
             return False, 0, 0
             
+        # Get actual frame dimensions (may differ from reported properties)
+        actual_height, actual_width = frame.shape[:2]
+        if actual_width != width or actual_height != height:
+            print(f"Warning: Reported dimensions ({width}x{height}) differ from actual frame dimensions ({actual_width}x{actual_height})")
+            width, height = actual_width, actual_height
+        
+        # Release the video capture object
+        cap.release()
+        
+        # Check if height is at least 720 pixels
+        is_hd = height >= 720
+        
+        print(f"Video {video_path}: Resolution {width}x{height}, HD: {is_hd}")
+        
+        return is_hd, width, height
+        
     except Exception as e:
         print(f"Error checking resolution for {video_path}: {e}")
         return False, 0, 0
 
-def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.15, val_split=0.15, min_hd=False, fresh_run=True):
+def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.15, val_split=0.15, min_hd=False, fresh_run=True, max_attempts=20):
     """
     Download a single OpenVid-1M ZIP file and extract a random sample of videos.
     
@@ -60,6 +71,7 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
         val_split: Fraction of data for validation set (default: 0.15)
         min_hd: If True, only keep videos with at least 720p resolution (default: False)
         fresh_run: If True, ignore existing videos and download a fresh batch (default: True)
+        max_attempts: Maximum number of attempts to find videos (default: 20)
     """
     
     # Create directory structure
@@ -74,17 +86,21 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     val_folder = os.path.join(output_directory, "val")
     
     # Create a database to track low-resolution videos to skip in future runs
-    low_res_db_path = os.path.join(data_folder, "low_resolution_videos.json")
-    low_res_videos = set()
+    low_res_db_path = os.path.join(data_folder, "low_resolution_videos.csv")
+    current_zip_low_res = set()
     
     # Load existing low-resolution video database if it exists
     if os.path.exists(low_res_db_path):
         try:
-            with open(low_res_db_path, 'r') as f:
-                low_res_videos = set(json.load(f))
-            print(f"Loaded database of {len(low_res_videos)} low-resolution videos to skip")
+            low_res_df = pd.read_csv(low_res_db_path)
+            # Filter to get only videos for the current zip part
+            if not low_res_df.empty and 'zip_part' in low_res_df.columns and 'video' in low_res_df.columns:
+                current_zip_df = low_res_df[low_res_df['zip_part'] == zip_part]
+                current_zip_low_res = set(current_zip_df['video'].tolist())
+            print(f"Loaded {len(current_zip_low_res)} known low-resolution videos for ZIP part {zip_part}")
         except Exception as e:
             print(f"Error loading low-resolution database: {e}")
+            current_zip_low_res = set()
     
     for folder in [zip_folder, data_folder, mapping_folder, train_folder, test_folder, val_folder]:
         os.makedirs(folder, exist_ok=True)
@@ -209,7 +225,7 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     
     if batch_size == 0:
         print("No suitable videos available in this ZIP part. Try another ZIP part.")
-        if min_hd and len(set(zip_videos).intersection(low_res_videos)) > 0:
+        if min_hd and len(set(zip_videos).intersection(current_zip_low_res)) > 0:
             print(f"ZIP part {zip_part} has been exhausted of HD (720p+) videos. Please try another ZIP part.")
         shutil.rmtree(temp_extract_folder)
         return
@@ -220,7 +236,9 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     attempted_videos = set()
     new_low_res_videos = []
     
-    while len(successful_hd_videos) < remaining_videos_needed and len(attempted_videos) < len(zip_videos):
+    attempt_count = 0
+    
+    while len(successful_hd_videos) < remaining_videos_needed and len(attempted_videos) < len(zip_videos) and attempt_count < max_attempts:
         # Select a batch of videos we haven't tried yet
         remaining_videos = [v for v in zip_videos if v not in attempted_videos]
         current_batch_size = min(batch_size, len(remaining_videos), remaining_videos_needed * 2 - len(successful_hd_videos))
@@ -231,8 +249,9 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
             
         current_batch = random.sample(remaining_videos, current_batch_size)
         attempted_videos.update(current_batch)
+        attempt_count += 1
         
-        print(f"Extracting batch of {len(current_batch)} videos (attempt {len(attempted_videos)}/{len(zip_videos)})...")
+        print(f"Extracting batch of {len(current_batch)} videos (attempt {attempt_count}/{max_attempts})...")
         
         # Extract the current batch
         current_successful = []
@@ -242,11 +261,13 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
             
             # Extract to temporary folder
             try:
-                subprocess.run(
+                # Use a timeout for extraction to handle potential corrupted archives
+                extraction_process = subprocess.run(
                     ["unzip", "-j", zip_path, video_in_zip, "-d", temp_extract_folder],
                     check=True,
                     stdout=subprocess.DEVNULL,  # Suppress output
-                    stderr=subprocess.DEVNULL
+                    stderr=subprocess.DEVNULL,
+                    timeout=30  # Set a 30-second timeout for extraction
                 )
                 
                 # The unzip might extract with the original path structure
@@ -260,8 +281,18 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
                         renamed_path = os.path.join(temp_extract_folder, video)
                         os.rename(extracted_path, renamed_path)
                     
+                    # Quick file size check - corrupted videos are often very small
+                    file_size = os.path.getsize(os.path.join(temp_extract_folder, video))
+                    if file_size < 10000:  # Skip suspiciously small files (less than 10KB)
+                        print(f"Skipping suspiciously small file: {video} ({file_size} bytes)")
+                        os.remove(os.path.join(temp_extract_folder, video))
+                        continue
+                    
                     current_successful.append(video)
-                
+            
+            except subprocess.TimeoutExpired:
+                print(f"Extraction timed out for {video} - possibly corrupted file")
+            
             except Exception as e:
                 print(f"Failed to extract {video}: {e}")
         
@@ -292,10 +323,24 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     
     # Update low-resolution database if we're filtering by HD
     if min_hd and new_low_res_videos:
-        low_res_videos.update(new_low_res_videos)
-        with open(low_res_db_path, 'w') as f:
-            json.dump(list(low_res_videos), f)
-        print(f"Added {len(new_low_res_videos)} new videos to low-resolution database (total: {len(low_res_videos)})")
+        # Create dataframe for new low-res videos
+        new_low_res_df = pd.DataFrame({
+            'zip_part': [zip_part] * len(new_low_res_videos),
+            'video': new_low_res_videos
+        })
+        
+        # Append to existing or create new
+        if os.path.exists(low_res_db_path):
+            existing_df = pd.read_csv(low_res_db_path)
+            combined_df = pd.concat([existing_df, new_low_res_df], ignore_index=True)
+            # Remove potential duplicates
+            combined_df = combined_df.drop_duplicates(subset=['zip_part', 'video'])
+            combined_df.to_csv(low_res_db_path, index=False)
+            print(f"Added {len(new_low_res_videos)} new videos to low-resolution database for ZIP part {zip_part}")
+            print(f"Total low-resolution videos in database: {len(combined_df)}")
+        else:
+            new_low_res_df.to_csv(low_res_db_path, index=False)
+            print(f"Created new low-resolution database with {len(new_low_res_videos)} videos")
     
     # Get metadata for successful videos
     selected_metadata = metadata[metadata['video'].isin(successful_hd_videos)]
@@ -367,28 +412,26 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     # Print summary
     print("\nDownload and split complete!")
 
-    total_videos = len(existing_train_videos) + len(existing_test_videos) + len(existing_val_videos) + len(successful_hd_videos)
-    print(f"Total videos: {total_videos}/{sample_size} ({len(successful_hd_videos)} new)")
-
     if min_hd:
         print(f"HD filter: Collected {len(successful_hd_videos)} new videos with at least 720p resolution")
         print(f"Identified {len(new_low_res_videos)} new low-resolution videos (skipped)")
     
-    print(f"Train set: {len(train_videos)} new videos (total: {len(existing_train_videos) + len(train_videos)})")
-    print(f"Test set: {len(test_videos)} new videos (total: {len(existing_test_videos) + len(test_videos)})")
-    print(f"Validation set: {len(val_videos)} new videos (total: {len(existing_val_videos) + len(val_videos)})")
+    print(f"Train set: {len(train_videos)} new videos")
+    print(f"Test set: {len(test_videos)} new videos")
+    print(f"Validation set: {len(val_videos)} new videos")
     print(f"Files saved to: {output_directory}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Download videos from a single OpenVid-1M ZIP part')
     parser.add_argument('--output_directory', type=str, help='Path to the dataset directory', default="./data")
-    parser.add_argument('--zip_part', type=int, help='Which ZIP part to download (0-185)', default=0)
+    parser.add_argument('--zip_part', type=int, help='Which ZIP part to download (0-185) and/or use', default=0)
     parser.add_argument('--sample_size', type=int, help='Number of video-text pairs to download', default=100)
     parser.add_argument('--test_split', type=float, help='Fraction of data for test set', default=0.15)
     parser.add_argument('--val_split', type=float, help='Fraction of data for validation set', default=0.15)
     parser.add_argument('--no_hd_filter', action='store_false', dest='min_hd', default=True, help='Disable HD filtering (at least 720p)')
     parser.add_argument('--no_fresh_run', action='store_false', dest='fresh_run', default=True, help='Skip download if target number already exists')
+    parser.add_argument('--max_attempts', type=int, help='Maximum number of attempts to find videos', default=20)
     args = parser.parse_args()
     
-    download_sample(args.output_directory, args.zip_part, args.sample_size, args.test_split, args.val_split, args.min_hd, args.fresh_run)
+    download_sample(args.output_directory, args.zip_part, args.sample_size, args.test_split, args.val_split, args.min_hd, args.fresh_run, args.max_attempts)
