@@ -105,7 +105,7 @@ def find_best_video_file(video_files, preferred_height=720):
     return selected_video
 
 
-def download_popular_videos(api_key, total_videos=1000, per_page=80, output_dir="pexels_videos"):
+def download_popular_videos(api_key, total_videos=200, per_page=80, output_dir="pexels_videos"):
     """
     Download popular videos from Pexels API, prioritizing 720p resolution
     
@@ -266,7 +266,7 @@ def download_file(url, path):
 if __name__ == "__main__":
     questions = [
         inquirer.Text('api_key', message='Enter your Pexels API key'),
-        inquirer.Text('count', message='Number of videos to download', default='1000'),
+        inquirer.Text('count', message='Number of videos to download', default='200'),
         inquirer.Text('output', message='Output directory', default='data/pexels')
     ]
     

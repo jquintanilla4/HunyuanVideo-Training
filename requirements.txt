@@ -11,3 +11,4 @@ einops
 huggingface-hub
 inquirer
 opencv-python
+tqdm

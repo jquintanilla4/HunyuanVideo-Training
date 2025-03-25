@@ -59,7 +59,7 @@ def check_video_resolution(video_path):
         print(f"Error checking resolution for {video_path}: {e}")
         return False, 0, 0
 
-def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.15, val_split=0.15, min_hd=False, fresh_run=True, max_attempts=20):
+def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.15, val_split=0.15, min_hd=False, keep_existing=False, max_attempts=20):
     """
     Download a single OpenVid-1M ZIP file and extract a random sample of videos.
     
@@ -69,8 +69,8 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
         sample_size: Number of video-text pairs to download (default: 100)
         test_split: Fraction of data for test set (default: 0.15)
         val_split: Fraction of data for validation set (default: 0.15)
-        min_hd: If True, only keep videos with at least 720p resolution (default: False)
-        fresh_run: If True, ignore existing videos and download a fresh batch (default: True)
+        min_hd: If True, only keep videos with at least 720p resolution (default: True)
+        keep_existing: If True, Keep and use existing videos instead of overwriting existing ones with fresh downloads (default: True)
         max_attempts: Maximum number of attempts to find videos (default: 20)
     """
     
@@ -158,16 +158,16 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     all_existing_videos = existing_train_videos.union(existing_test_videos).union(existing_val_videos)
     print(f"Total existing videos across all splits: {len(all_existing_videos)}")
     
-    # If fresh_run is True, we'll download a full new batch regardless of existing videos
-    if fresh_run:
+    # If keep_existing is False, we'll download a full new batch regardless of existing videos
+    if not keep_existing:
         print("Fresh run requested - ignoring existing videos and downloading a full new batch")
         remaining_videos_needed = sample_size
     else:
         remaining_videos_needed = sample_size - len(all_existing_videos)
         
-    if remaining_videos_needed <= 0 and not fresh_run:
+    if remaining_videos_needed <= 0 and not keep_existing:
         print(f"Already have {len(all_existing_videos)} videos, which meets or exceeds the target of {sample_size}.")
-        print("No new videos will be downloaded. Use --fresh_run to download a new batch.")
+        print("No new videos will be downloaded. Use --keep_existing to download a new batch.")
         return
     
     print(f"Need {remaining_videos_needed} more videos to reach target of {sample_size}")
@@ -221,8 +221,21 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
     
     # Modified approach: Keep extracting videos until we have enough HD videos
     successful_hd_videos = []
-    batch_size = min(remaining_videos_needed * 2, len(zip_videos))  # Extract more than needed as some will be filtered out
     
+    # Fix the batch size calculation to prevent negative numbers
+    if remaining_videos_needed <= 0:
+        if not keep_existing:
+            print("Already have enough videos. Use --keep_existing=false to force new downloads.")
+            shutil.rmtree(temp_extract_folder)
+            return
+        else:
+            # If we want new videos anyway, set a positive batch size
+            remaining_videos_needed = sample_size
+            
+    # Calculate batch size - use full sample size if ≤ 500, otherwise use 1/5 of sample size
+    batch_size = remaining_videos_needed if remaining_videos_needed <= 1000 else remaining_videos_needed // 10
+    batch_size = min(batch_size, len(zip_videos))  # Ensure we don't exceed available videos
+
     if batch_size == 0:
         print("No suitable videos available in this ZIP part. Try another ZIP part.")
         if min_hd and len(set(zip_videos).intersection(current_zip_low_res)) > 0:
@@ -430,8 +443,16 @@ if __name__ == '__main__':
     parser.add_argument('--test_split', type=float, help='Fraction of data for test set', default=0.15)
     parser.add_argument('--val_split', type=float, help='Fraction of data for validation set', default=0.15)
     parser.add_argument('--no_hd_filter', action='store_false', dest='min_hd', default=True, help='Disable HD filtering (at least 720p)')
-    parser.add_argument('--no_fresh_run', action='store_false', dest='fresh_run', default=True, help='Skip download if target number already exists')
+    parser.add_argument('--keep_existing', action='store_true', dest='keep_existing', default=True, 
+                       help='Keep and use existing videos instead of overwriting existing ones with fresh downloads')
     parser.add_argument('--max_attempts', type=int, help='Maximum number of attempts to find videos', default=20)
     args = parser.parse_args()
     
-    download_sample(args.output_directory, args.zip_part, args.sample_size, args.test_split, args.val_split, args.min_hd, args.fresh_run, args.max_attempts)
+    download_sample(args.output_directory, 
+                    args.zip_part,
+                    args.sample_size,
+                    args.test_split,
+                    args.val_split,
+                    args.min_hd,
+                    args.keep_existing, 
+                    args.max_attempts)
