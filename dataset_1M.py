@@ -68,7 +68,7 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
         test_split: Fraction of data for test set (default: 0.15)
         val_split: Fraction of data for validation set (default: 0.15)
         min_hd: If True, only keep videos with at least 720p resolution (default: False)
-        keep_existing: If True, use existing videos and download only what’s needed (default: False)
+        keep_existing: If True, use existing videos and download only what's needed (default: False)
         max_attempts: Maximum number of attempts to find videos (default: 20)
     """
     # Directory setup
@@ -111,20 +111,33 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
         cache_dir=mapping_folder
     )
     mapping_df = pd.read_csv(mapping_path)
-    zip_videos = [v for v in mapping_df['video'].tolist() if v not in current_zip_low_res]
-    print(f"Found {len(zip_videos)} potential videos in ZIP part {zip_part}")
 
     # Check existing videos
     all_existing_videos = set()
-    for split_name, split_folder in [('train', train_folder), ('test', test_folder), ('val', val_folder)]:
+    for split_name in ['train', 'test', 'val']:
+        split_folder = os.path.join(output_directory, split_name)
         metadata_path = os.path.join(split_folder, f"{split_name}_metadata.csv")
+        videos_folder = os.path.join(split_folder, "videos")
+        
         if os.path.exists(metadata_path):
             try:
                 existing_df = pd.read_csv(metadata_path)
-                all_existing_videos.update(existing_df['video'].tolist())
+                for video in existing_df['video'].tolist():
+                    video_path = os.path.join(videos_folder, video)
+                    if os.path.exists(video_path):
+                        all_existing_videos.add(video)
             except Exception as e:
                 print(f"Error reading {split_name} metadata: {e}")
-    print(f"Total existing videos: {len(all_existing_videos)}")
+
+    print(f"Total existing videos with both metadata and video files: {len(all_existing_videos)}")
+
+    # Filter Potential Videos
+    zip_videos = [v for v in mapping_df['video'].tolist() if v not in all_existing_videos]
+    print(f"Found {len(zip_videos)} potential videos in ZIP part {zip_part} after filtering existing videos")
+
+    # Additional filtering for low-resolution videos
+    zip_videos = [v for v in zip_videos if v not in current_zip_low_res]
+    print(f"Found {len(zip_videos)} potential videos after filtering known low-res videos")
 
     # Determine how many videos to download
     if keep_existing:
