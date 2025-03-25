@@ -274,14 +274,14 @@ def download_sample(output_directory, zip_part=0, sample_size=100, test_split=0.
 # Argument parsing remains unchanged
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Download videos from a single OpenVid-1M ZIP part')
-    parser.add_argument('--output_directory', type=str, default="./data")
-    parser.add_argument('--zip_part', type=int, default=0)
-    parser.add_argument('--sample_size', type=int, default=100)
-    parser.add_argument('--test_split', type=float, default=0.15)
-    parser.add_argument('--val_split', type=float, default=0.15)
-    parser.add_argument('--no_hd_filter', action='store_false', dest='min_hd', default=True)
-    parser.add_argument('--keep_existing', action='store_true', default=False)
-    parser.add_argument('--max_attempts', type=int, default=20)
+    parser.add_argument('--output_directory', type=str, default="./data", help="Output directory for the dataset")
+    parser.add_argument('--zip_part', type=int, default=0, help="ZIP part number to download")
+    parser.add_argument('--sample_size', type=int, default=100, help="Number of video-text pairs to download")
+    parser.add_argument('--test_split', type=float, default=0.15, help="Fraction of data for test set")
+    parser.add_argument('--val_split', type=float, default=0.15, help="Fraction of data for validation set")
+    parser.add_argument('--no_hd_filter', action='store_false', dest='min_hd', default=True, help="Don't filter videos by resolution")
+    parser.add_argument('--keep_existing', action='store_true', default=False, help="Use existing videos and download only what's needed")
+    parser.add_argument('--max_attempts', type=int, default=20, help="Maximum number of attempts to find videos")
     args = parser.parse_args()
     
     download_sample(args.output_directory, args.zip_part, args.sample_size, args.test_split, 
