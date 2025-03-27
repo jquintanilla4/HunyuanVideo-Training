@@ -3,7 +3,8 @@ transformers
 accelerate
 bitsandbytes
 tensorboard
-decord
+decord; platform_machine != "arm64"
+eva-decord; platform_machine == "arm64"
 peft
 imageio
 imageio-ffmpeg
@@ -12,3 +13,4 @@ huggingface-hub
 inquirer
 opencv-python
 tqdm
+pandas
