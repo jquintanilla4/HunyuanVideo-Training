@@ -781,7 +781,7 @@ def main(args):
                     depth_tensor[b, f] = torch.tensor(depth, device=pixels.device)
             
             depth_tensor = depth_tensor.unsqueeze(1)  # (B, 1, F, H, W)
-            control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=torch.bfloat16)  # Replicate to 3 channels
+            control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=vae.dtype)  # Replicate to 3 channels; matches the vae dtype
 
             # Shape and value assertions
             assert control.shape[0] == pixels.shape[0], f"Batch dimension mismatch: {control.shape[0]} vs {pixels.shape[0]}"
