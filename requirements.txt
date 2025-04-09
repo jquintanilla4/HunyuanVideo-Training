@@ -14,3 +14,4 @@ inquirer
 opencv-python
 tqdm
 pandas
+av

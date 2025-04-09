@@ -183,3 +183,6 @@ outputs/*
 
 # Project specific files
 legacy/
+pexels/
+test/source_videos/*
+test/test_control/*
