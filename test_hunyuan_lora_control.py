@@ -2,31 +2,27 @@ import os
 import gc
 import argparse
 import torch
-import bitsandbytes as bnb # Keep if you might use BNB quantization later
+import bitsandbytes as bnb
 import numpy as np
-import random
 from PIL import Image
 import decord
+import imageio
 from torchvision.transforms import v2, InterpolationMode
 from contextlib import contextmanager
-import inspect
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
-from peft import PeftModel, LoraConfig, set_peft_model_state_dict # Keep if using PEFT
+from peft import PeftModel, LoraConfig, set_peft_model_state_dict
 
 from transformers import CLIPTextModel, CLIPTokenizerFast, LlamaModel, LlamaTokenizerFast
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel, AutoencoderKLHunyuanVideo
-from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig # Keep if needed
-from diffusers.utils import export_to_video, logging, replace_example_docstring
+from diffusers.utils import export_to_video, logging
 from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import retrieve_timesteps
 from diffusers.pipelines.hunyuan_video.pipeline_output import HunyuanVideoPipelineOutput
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.callbacks import PipelineCallback, MultiPipelineCallbacks
 
-# Assuming Depth Anything V2 code is in utils/depth_anything_v2
 try:
     from utils.depth_anything_v2.dpt import DepthAnythingV2
     print("Imported DepthAnythingV2")
@@ -38,6 +34,13 @@ logger = logging.get_logger(__name__)
 
 # --- Custom Control LoRA Pipeline ---
 class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
+    DEFAULT_PROMPT_TEMPLATE = {
+        "template": "{}",
+        "positive": "{text}",
+        "negative": "",
+        "text_embedding": "{text}",
+    }
+
     @torch.no_grad()
     def __call__(
         self,
@@ -72,7 +75,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
     ):
         prompt_template = prompt_template if prompt_template is not None else self.DEFAULT_PROMPT_TEMPLATE
 
-        if isinstance(callback_on_step_end, ("PipelineCallback", "MultiPipelineCallbacks")):
+        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
         self.check_inputs(
@@ -175,19 +178,25 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         else:
             num_channels_latents = self.transformer.config.in_channels
 
-        num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        # We calculate num_latent_frames here for validation/logging,
+        # but prepare_latents needs the original num_frames.
+        num_latent_frames_expected = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         if latents is None:
             latents = self.prepare_latents(
                 batch_size * num_videos_per_prompt,
                 num_channels_latents,
                 height,
                 width,
-                num_latent_frames,
+                num_frames, # <--- Pass the original num_frames here
                 torch.float32,
                 main_device, # Latents on main device
                 generator,
                 latents=None,
             )
+            # Optional: Verify the shape after prepare_latents
+            if latents.shape[2] != num_latent_frames_expected:
+                 logger.warning(f"Prepared latents have {latents.shape[2]} frames, but expected {num_latent_frames_expected} based on num_frames and temporal scale factor.")
+
         else:
              if control_latents is not None and latents.shape[1] != num_channels_latents:
                   raise ValueError(f"Provided `latents` have {latents.shape[1]} channels, but expected {num_channels_latents} for control model base.")
@@ -216,7 +225,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                                 self.transformer.single_blocks[j].to(main_device)
                     except Exception as e:
                         logger.error(f"Error moving blocks to main device at step {i}: {e}")
-                        # Potentially fall back to no swapping or raise error
+                        
 
                 # Prepare model input
                 if control_latents is not None:
@@ -225,7 +234,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 else:
                     model_input = latents.to(transformer_dtype)
 
-                timestep = t.expand(latents.shape[0]).to(latents.dtype) # Should already be on main_device
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 timestep = timestep.to(transformer_dtype)
 
                 # Predict noise
@@ -337,6 +346,12 @@ def parse_args():
         help="Load LoRA as control lora (requires modified input layer and control_input)",
         )
     parser.add_argument(
+        "--control_lora_weight",
+        type=float,
+        default=1.0,
+        help="Weight to apply to the control LoRA adapter (only used with --control_lora)",
+        )
+    parser.add_argument(
         "--control_input",
         type = str,
         default = None,
@@ -357,7 +372,7 @@ def parse_args():
         )
     # --- Standard Args ---
     parser.add_argument(
-        "--alpha", # Note: For control lora rank 128, alpha 128, this isn't strictly needed if we hardcode weight=1
+        "--alpha",
         type = int,
         default = None, # Will default to rank if None
         help = "lora alpha, defaults to rank"
@@ -444,19 +459,24 @@ def preprocess_control(args, pixels, depth_model, device):
         B, C, F, H, W = pixels.shape
         depth_tensor = torch.zeros((B, F, H, W), device=pixels.device, dtype=torch.float32) # Use float32 for processing
 
+        # --- List to store depth frames for video ---
+        depth_frames_for_video = []
+
         print(f"Preprocessing {B}x{F} frames for depth...")
         for b in range(B):
+            if b > 0:
+                depth_frames_for_video = []
+
             for f in range(F):
                 # Convert frame to format expected by Depth Anything V2 (H, W, C), range [0, 1]
                 frame = pixels[b, :, f].float() * 0.5 + 0.5 # Denormalize [-1,1] -> [0,1]
                 frame_np = frame.permute(1, 2, 0).cpu().numpy() # CHW -> HWC
-
-                # Depth model expects numpy HWC
                 depth = depth_model.infer_image(frame_np) # Returns numpy H W
 
                 # Resize depth map back to original H, W if needed (model might output different size)
                 depth_h, depth_w = depth.shape
                 if depth_h != H or depth_w != W:
+                    # Note: resizing might put tensor on 'device' (GPU)
                     depth_tensor_resized = torch.tensor(depth, device=device).unsqueeze(0).unsqueeze(0) # 1, 1, dH, dW
                     depth_tensor_resized = v2.functional.resize(
                         depth_tensor_resized,
@@ -464,17 +484,52 @@ def preprocess_control(args, pixels, depth_model, device):
                         interpolation=InterpolationMode.BICUBIC,
                         antialias=True
                     )
+                    # --- Explicitly move resized tensor to CPU before NumPy ---
                     depth = depth_tensor_resized.squeeze().cpu().numpy()
+                # else: depth is already a NumPy array from infer_image
 
-                # Normalize depth map to [-1, 1]
+                # Normalize depth map for visualization (0 to 1) - ensure it's numpy
                 depth_min, depth_max = depth.min(), depth.max()
-                if depth_max > depth_min: # Avoid division by zero for flat depth maps
-                    depth_normalized = (depth - depth_min) / (depth_max - depth_min)
+                if depth_max > depth_min:
+                    depth_normalized_01 = (depth - depth_min) / (depth_max - depth_min)
                 else:
-                    depth_normalized = np.zeros_like(depth)
-                depth_scaled = depth_normalized * 2.0 - 1.0 # Scale to [-1, 1]
+                    depth_normalized_01 = np.zeros_like(depth) # depth is numpy here
 
-                depth_tensor[b, f] = torch.tensor(depth_scaled, device=device)
+                # --- Store frame for video ---
+                try:
+                    # --- Force conversion to numpy right before use ---
+                    if isinstance(depth_normalized_01, torch.Tensor):
+                        print(f"WARN: Converting depth_normalized_01 from Tensor to ndarray at frame {f}")
+                        current_depth_np = depth_normalized_01.cpu().numpy()
+                    elif isinstance(depth_normalized_01, np.ndarray):
+                        current_depth_np = depth_normalized_01 # Already numpy
+                    else:
+                        # Attempt conversion if it's some other type
+                        print(f"WARN: Unexpected type for depth_normalized_01 ({type(depth_normalized_01)}), attempting np.array()")
+                        current_depth_np = np.array(depth_normalized_01)
+
+                    depth_img_np = (current_depth_np * 255).astype(np.uint8)
+                    # --- END FORCE CONVERSION ---
+                    depth_frames_for_video.append(depth_img_np)
+                except Exception as e:
+                    # Add type info to error
+                    print(f"WARN: Failed to store depth frame {b}-{f} for video (type: {type(depth_normalized_01)}): {e}")
+
+                # Scale depth map to [-1, 1] for VAE input
+                # depth_normalized_01 is numpy from normalization step
+                depth_scaled_np = depth_normalized_01 * 2.0 - 1.0
+                depth_tensor[b, f] = torch.tensor(depth_scaled_np, device=device, dtype=torch.float32)
+
+            # --- Save depth video for this batch item ---
+            if depth_frames_for_video:
+                output_video_path = os.path.join(args.output_dir, f"debug_depth_video_batch_{b:02d}.mp4")
+                print(f"DEBUG: Saving depth video ({len(depth_frames_for_video)} frames) to: {output_video_path}")
+                try:
+                    rgb_depth_frames = np.stack([depth_frames_for_video]*3, axis=-1)
+                    imageio.mimsave(output_video_path, rgb_depth_frames, fps=15)
+                except Exception as e:
+                    print(f"ERROR: Failed to save debug depth video: {e}")
+
 
         # Reshape and replicate to 3 channels for VAE
         depth_tensor = depth_tensor.unsqueeze(1) # (B, 1, F, H, W)
@@ -576,18 +631,32 @@ def main(args):
         lora_sd = load_file(args.lora, device="cpu") # Load to CPU first
 
         if args.control_lora:
-            rank = 128
-            alpha = 128
-            lora_weight = 1.0
-            print(f"Control LoRA detected: Using fixed rank={rank}, alpha={alpha}, weight={lora_weight}")
+            rank = 0 # Infer rank from loaded state dict
+            for key in lora_sd.keys():
+                if ".lora_A.weight" in key:
+                    rank = lora_sd[key].shape[0]
+                    break
+            if rank == 0:
+                 print("WARNING: Could not infer LoRA rank from state dict keys.")
+                 rank = args.alpha if args.alpha is not None else 128 # Default fallback rank
+                 print(f"Falling back to rank: {rank}")
+
+            alpha = args.alpha if args.alpha is not None else rank # Default alpha to rank if not given
+            lora_weight = args.control_lora_weight
+            print(f"Control LoRA: Inferred rank={rank}, alpha={alpha}, Using specified weight={lora_weight}")
         else:
             rank = 0
             for key in lora_sd.keys():
                 if ".lora_A.weight" in key:
                     rank = lora_sd[key].shape[0]
                     break
+            if rank == 0:
+                 print("WARNING: Could not infer LoRA rank from state dict keys.")
+                 rank = args.alpha if args.alpha is not None else 128 # Default fallback rank
+                 print(f"Falling back to rank: {rank}")
+
             alpha = args.alpha if args.alpha is not None else rank
-            lora_weight = alpha / rank
+            lora_weight = alpha / rank if rank > 0 else 1.0 # Avoid division by zero
             print(f"Standard LoRA: Inferred rank={rank}, alpha={alpha}, weight={lora_weight:.4f}")
 
         lora_target_modules = []
@@ -624,7 +693,7 @@ def main(args):
         transformer.set_adapters(adapter_names="default_lora", weights=lora_weight)
         print(f"Set adapter 'default_lora' with weight {lora_weight}")
 
-    transformer = transformer.to(device) # Ensure transformer is on main device after LoRA
+    transformer = transformer.to(device)
 
     control_latents = None
     if args.control_lora:
@@ -669,7 +738,7 @@ def main(args):
         text_encoder_2=text_encoder_clip,
         tokenizer_2=tokenizer_clip,
     )
-    pipe = pipe.to(device) # Pipe components should end up on 'device'
+    pipe = pipe.to(device)
     pipe.vae.enable_tiling(
             tile_sample_min_height=256,
             tile_sample_min_width=256,
@@ -694,10 +763,10 @@ def main(args):
         num_inference_steps=args.inference_steps,
         generator=generator,
         control_latents=control_latents,
+        prompt_template=pipe.DEFAULT_PROMPT_TEMPLATE,
         # --- Pass Block Swap Args ---
-        double_blocks_to_swap=args.double_blocks_to_swap,
-        single_blocks_to_swap=args.single_blocks_to_swap,
-        # --------------------------
+        double_blocks_to_swap=args.double_blocks_swap,
+        single_blocks_to_swap=args.single_blocks_swap,
     ).frames[0]
 
     export_to_video(
