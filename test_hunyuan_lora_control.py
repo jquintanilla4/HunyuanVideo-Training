@@ -68,7 +68,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         prompt_template: Dict[str, Any] = None,
         max_sequence_length: int = 256,
-        # --- Block Swap Args ---
         double_blocks_to_swap: int = 0,  # Default to 0 (no swap)
         single_blocks_to_swap: int = 0,  # Default to 0 (no swap)
     ):
@@ -108,10 +107,9 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
 
-        main_device = self._execution_device  # Use the pipeline's execution device
-        offload_device = torch.device("cpu")  # Offload to CPU
+        main_device = self._execution_device
+        offload_device = torch.device("cpu")
 
-        # Validate swap counts
         max_double_blocks = len(getattr(self.transformer, "double_blocks", []))
         max_single_blocks = len(getattr(self.transformer, "single_blocks", []))
         double_blocks_to_swap = min(double_blocks_to_swap, max_double_blocks)
@@ -121,7 +119,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
             logger.info(
                 f"Block Swapping Enabled: Swapping {double_blocks_to_swap}/{max_double_blocks} double blocks and {single_blocks_to_swap}/{max_single_blocks} single blocks."
             )
-            # --- Initial Offload ---
             try:
                 logger.info(f"Initial offload to {offload_device}...")
                 if hasattr(self.transformer, "double_blocks"):
@@ -135,7 +132,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 logger.info("Initial offload complete.")
             except Exception as e:
                 logger.error(f"Error during initial block offload: {e}")
-                # Continue without swapping if initial offload fails
                 double_blocks_to_swap = 0
                 single_blocks_to_swap = 0
         else:
@@ -156,7 +152,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
-            device=main_device,  # Encode prompts on main device
+            device=main_device,
             max_sequence_length=max_sequence_length,
         )
 
@@ -170,7 +166,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
-            main_device,  # Timesteps on main device
+            main_device,
             sigmas=sigmas,
         )
 
@@ -186,8 +182,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         else:
             num_channels_latents = self.transformer.config.in_channels
 
-        # We calculate num_latent_frames here for validation/logging,
-        # but prepare_latents needs the original num_frames.
         num_latent_frames_expected = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         if latents is None:
             latents = self.prepare_latents(
@@ -195,18 +189,16 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 num_channels_latents,
                 height,
                 width,
-                num_frames,  # <--- Pass the original num_frames here
+                num_frames,
                 torch.float32,
-                main_device,  # Latents on main device
+                main_device,
                 generator,
                 latents=None,
             )
-            # Optional: Verify the shape after prepare_latents
             if latents.shape[2] != num_latent_frames_expected:
                 logger.warning(
                     f"Prepared latents have {latents.shape[2]} frames, but expected {num_latent_frames_expected} based on num_frames and temporal scale factor."
                 )
-
         else:
             if control_latents is not None and latents.shape[1] != num_channels_latents:
                 raise ValueError(
@@ -228,7 +220,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 if self.interrupt:
                     continue
 
-                # --- Block Swapping: Move to Main Device ---
                 if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
                     try:
                         if hasattr(self.transformer, "double_blocks"):
@@ -240,7 +231,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                     except Exception as e:
                         logger.error(f"Error moving blocks to main device at step {i}: {e}")
 
-                # Prepare model input
                 if control_latents is not None:
                     control_latents_input = control_latents.to(device=main_device, dtype=transformer_dtype)
                     model_input = torch.cat([latents.to(transformer_dtype), control_latents_input], dim=1)
@@ -250,7 +240,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 timestep = timestep.to(transformer_dtype)
 
-                # Predict noise
                 noise_pred = self.transformer(
                     hidden_states=model_input,
                     timestep=timestep,
@@ -262,7 +251,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                     return_dict=False,
                 )[0]
 
-                # --- Block Swapping: Move back to Offload Device ---
                 if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
                     try:
                         if hasattr(self.transformer, "double_blocks"):
@@ -271,16 +259,13 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                         if hasattr(self.transformer, "single_blocks"):
                             for j in range(single_blocks_to_swap):
                                 self.transformer.single_blocks[j].to(offload_device)
-                        # Optional: Force memory cleanup
                         gc.collect()
                         torch.cuda.empty_cache()
                     except Exception as e:
                         logger.error(f"Error moving blocks to offload device at step {i}: {e}")
 
-                # Scheduler step
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-                # Callbacks
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
@@ -290,11 +275,9 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                # Progress bar
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
-        # --- Final Offload (if swapping was enabled) ---
         if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
             try:
                 logger.info(f"Final offload to {offload_device}...")
@@ -310,7 +293,6 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
             except Exception as e:
                 logger.error(f"Error during final block offload: {e}")
 
-        # Decode latents
         if not output_type == "latent":
             latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
             video = self.vae.decode(latents, return_dict=False)[0]
@@ -325,11 +307,10 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
 
         return HunyuanVideoPipelineOutput(frames=video)
 
-# --- Helper Functions (from training script) ---
+# --- Helper Functions ---
 @contextmanager
 def timer(message=""):
     from time import perf_counter
-
     start_time = perf_counter()
     yield
     end_time = perf_counter()
@@ -353,7 +334,6 @@ def parse_args():
         default=None,
         help="LoRA file to test",
     )
-    # --- Control LoRA Args ---
     parser.add_argument(
         "--control_lora",
         action="store_true",
@@ -375,7 +355,7 @@ def parse_args():
         "--control_preprocess",
         type=str,
         default="depth",
-        choices=["depth"],  # Add more if needed
+        choices=["depth"],
         help="Preprocess to apply to control_input",
     )
     parser.add_argument(
@@ -384,11 +364,10 @@ def parse_args():
         default="./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth",
         help="Path to Depth Anything V2 model weights",
     )
-    # --- Standard Args ---
     parser.add_argument(
         "--alpha",
         type=int,
-        default=None,  # Will default to rank if None
+        default=None,
         help="lora alpha, defaults to rank",
     )
     parser.add_argument(
@@ -418,7 +397,7 @@ def parse_args():
     parser.add_argument(
         "--num_frames",
         type=int,
-        default=49,  # Must be (n * 4) + 1; was initially 33
+        default=49,
         help="Number of frames per video, must be divisible by 4+1",
     )
     parser.add_argument(
@@ -428,12 +407,17 @@ def parse_args():
         help="Number of steps for inference",
     )
     parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=6.0,
+        help="Guidance scale for prompt adherence (passed to transformer's internal mechanism)",
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default="A person typing on a laptop keyboard",
         help="Prompt for inference",
     )
-    # --- Block Swap Args ---
     parser.add_argument(
         "--double_blocks_swap",
         type=int,
@@ -446,7 +430,6 @@ def parse_args():
         default=0,
         help="Number of single transformer blocks to offload to CPU (0 = none).",
     )
-    # ---------------------
 
     args = parser.parse_args()
 
@@ -461,82 +444,61 @@ def parse_args():
 
 # --- Control Preprocessing ---
 def preprocess_control(args, pixels, depth_model, device):
-    """
-    Generates control tensor (e.g., depth) from input pixels.
-    pixels: Input tensor (B, C, F, H, W), range [-1, 1]
-    Returns: Control tensor (B, 3, F, H, W), range [-1, 1], dtype=torch.float16
-    """
     if args.control_preprocess == "depth":
         if depth_model is None:
             raise ValueError("Depth model not loaded, cannot preprocess for depth.")
 
         B, C, F, H, W = pixels.shape
-        depth_tensor = torch.zeros((B, F, H, W), device=pixels.device, dtype=torch.float32)  # Use float32 for processing
+        depth_tensor = torch.zeros((B, F, H, W), device=pixels.device, dtype=torch.float32)
 
-        # --- List to store depth frames for video ---
         depth_frames_for_video = []
-
         print(f"Preprocessing {B}x{F} frames for depth...")
         for b in range(B):
             if b > 0:
                 depth_frames_for_video = []
 
             for f in range(F):
-                # Convert frame to format expected by Depth Anything V2 (H, W, C), range [0, 1]
-                frame = pixels[b, :, f].float() * 0.5 + 0.5  # Denormalize [-1,1] -> [0,1]
-                frame_np = frame.permute(1, 2, 0).cpu().numpy()  # CHW -> HWC
-                depth = depth_model.infer_image(frame_np)  # Returns numpy H W
+                frame = pixels[b, :, f].float() * 0.5 + 0.5
+                frame_np = frame.permute(1, 2, 0).cpu().numpy()
+                depth = depth_model.infer_image(frame_np)
 
-                # Resize depth map back to original H, W if needed (model might output different size)
                 depth_h, depth_w = depth.shape
                 if depth_h != H or depth_w != W:
-                    # Note: resizing might put tensor on 'device' (GPU)
-                    depth_tensor_resized = torch.tensor(depth, device=device).unsqueeze(0).unsqueeze(0)  # 1, 1, dH, dW
+                    depth_tensor_resized = torch.tensor(depth, device=device).unsqueeze(0).unsqueeze(0)
                     depth_tensor_resized = v2.functional.resize(
                         depth_tensor_resized,
                         size=[H, W],
                         interpolation=InterpolationMode.BICUBIC,
                         antialias=True,
                     )
-                    # --- Explicitly move resized tensor to CPU before NumPy ---
                     depth = depth_tensor_resized.squeeze().cpu().numpy()
-                # else: depth is already a NumPy array from infer_image
 
-                # Normalize depth map for visualization (0 to 1) - ensure it's numpy
                 depth_min, depth_max = depth.min(), depth.max()
                 if depth_max > depth_min:
                     depth_normalized_01 = (depth - depth_min) / (depth_max - depth_min)
                 else:
-                    depth_normalized_01 = np.zeros_like(depth)  # depth is numpy here
+                    depth_normalized_01 = np.zeros_like(depth)
 
-                # --- Store frame for video ---
                 try:
-                    # --- Force conversion to numpy right before use ---
                     if isinstance(depth_normalized_01, torch.Tensor):
                         print(f"WARN: Converting depth_normalized_01 from Tensor to ndarray at frame {f}")
                         current_depth_np = depth_normalized_01.cpu().numpy()
                     elif isinstance(depth_normalized_01, np.ndarray):
-                        current_depth_np = depth_normalized_01  # Already numpy
+                        current_depth_np = depth_normalized_01
                     else:
-                        # Attempt conversion if it's some other type
                         print(
                             f"WARN: Unexpected type for depth_normalized_01 ({type(depth_normalized_01)}), attempting np.array()"
                         )
                         current_depth_np = np.array(depth_normalized_01)
 
                     depth_img_np = (current_depth_np * 255).astype(np.uint8)
-                    # --- END FORCE CONVERSION ---
                     depth_frames_for_video.append(depth_img_np)
                 except Exception as e:
-                    # Add type info to error
                     print(f"WARN: Failed to store depth frame {b}-{f} for video (type: {type(depth_normalized_01)}): {e}")
 
-                # Scale depth map to [-1, 1] for VAE input
-                # depth_normalized_01 is numpy from normalization step
                 depth_scaled_np = depth_normalized_01 * 2.0 - 1.0
                 depth_tensor[b, f] = torch.tensor(depth_scaled_np, device=device, dtype=torch.float32)
 
-            # --- Save depth video for this batch item ---
             if depth_frames_for_video:
                 output_video_path = os.path.join(args.output_dir, f"debug_depth_video_batch_{b:02d}.mp4")
                 print(f"DEBUG: Saving depth video ({len(depth_frames_for_video)} frames) to: {output_video_path}")
@@ -546,14 +508,11 @@ def preprocess_control(args, pixels, depth_model, device):
                 except Exception as e:
                     print(f"ERROR: Failed to save debug depth video: {e}")
 
-        # Reshape and replicate to 3 channels for VAE
-        depth_tensor = depth_tensor.unsqueeze(1)  # (B, 1, F, H, W)
-        control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=torch.float16)  # (B, 3, F, H, W)
+        depth_tensor = depth_tensor.unsqueeze(1)
+        control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=torch.float16)
 
-        # Assertions
         assert control.shape == (B, 3, F, H, W), f"Unexpected control shape: {control.shape}"
         assert not torch.isnan(control).any(), "NaN values detected in control tensor"
-        # Relaxed check due to potential float precision issues near -1/1
         assert control.min() >= -1.01 and control.max() <= 1.01, (
             f"Control values out of ~[-1,1] range: min={control.min().item()}, max={control.max().item()}"
         )
@@ -568,7 +527,7 @@ def preprocess_control(args, pixels, depth_model, device):
 def main(args):
     decord.bridge.set_bridge("torch")
     device = torch.cuda.current_device()
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)  # Use CPU generator for reproducibility
+    generator = torch.Generator(device="cpu").manual_seed(args.seed)
 
     # --- Load Models (VAE, Depth, Text Encoders) ---
     with timer("Loading VAE"):
@@ -579,17 +538,21 @@ def main(args):
         vae.enable_tiling(
             tile_sample_min_height=256,
             tile_sample_min_width=256,
-            tile_sample_min_num_frames=max(64, args.num_frames * 2),  # Adjust based on num_frames
+            tile_sample_min_num_frames=max(64, args.num_frames * 2),
             tile_sample_stride_height=192,
             tile_sample_stride_width=192,
             tile_sample_stride_num_frames=max(16, args.num_frames // 2),
         )
+        # Move VAE to CPU after loading to free GPU memory
+        vae.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
 
     depth_model = None
     if args.control_lora and args.control_preprocess == "depth":
         with timer("Loading Depth Model"):
             if not os.path.exists(args.depth_model_path):
-                raise FileNotFoundError(f"Depth model not found at {args.depth_model_path}. Please download or provide correct path.")
+                raise FileNotFoundError(f"Depth model not found at {args.depth_model_path}.")
             if DepthAnythingV2 is None:
                 raise ImportError("DepthAnythingV2 could not be imported.")
             depth_model = DepthAnythingV2(encoder="vits", features=64, out_channels=[48, 96, 192, 384])
@@ -608,9 +571,13 @@ def main(args):
             device=device, dtype=torch.bfloat16
         )
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model, subfolder="scheduler")
+        # Move text encoders to CPU after loading
+        text_encoder_clip.to("cpu")
+        text_encoder_llama.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
 
     with timer("Loading Transformer"):
-        # Load initially to main device for modifications/LoRA application
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
             args.pretrained_model,
             subfolder="transformer",
@@ -650,20 +617,20 @@ def main(args):
 
     if args.lora is not None:
         print(f"Loading LoRA adapter from: {args.lora}")
-        lora_sd = load_file(args.lora, device="cpu")  # Load to CPU first
+        lora_sd = load_file(args.lora, device="cpu")
 
         if args.control_lora:
-            rank = 0  # Infer rank from loaded state dict
+            rank = 0
             for key in lora_sd.keys():
                 if ".lora_A.weight" in key:
                     rank = lora_sd[key].shape[0]
                     break
             if rank == 0:
                 print("WARNING: Could not infer LoRA rank from state dict keys.")
-                rank = args.alpha if args.alpha is not None else 128  # Default fallback rank
+                rank = args.alpha if args.alpha is not None else 128
                 print(f"Falling back to rank: {rank}")
 
-            alpha = args.alpha if args.alpha is not None else rank  # Default alpha to rank if not given
+            alpha = args.alpha if args.alpha is not None else rank
             lora_weight = args.control_lora_weight
             print(f"Control LoRA: Inferred rank={rank}, alpha={alpha}, Using specified weight={lora_weight}")
         else:
@@ -674,25 +641,28 @@ def main(args):
                     break
             if rank == 0:
                 print("WARNING: Could not infer LoRA rank from state dict keys.")
-                rank = args.alpha if args.alpha is not None else 128  # Default fallback rank
+                rank = args.alpha if args.alpha is not None else 128
                 print(f"Falling back to rank: {rank}")
 
             alpha = args.alpha if args.alpha is not None else rank
-            lora_weight = alpha / rank if rank > 0 else 1.0  # Avoid division by zero
+            lora_weight = alpha / rank if rank > 0 else 1.0
             print(f"Standard LoRA: Inferred rank={rank}, alpha={alpha}, weight={lora_weight:.4f}")
 
-        # Load the LoRA adapter using the state dictionary
-        transformer.load_lora_adapter(lora_sd, adapter_name="default_lora")
+        # Ensure enough memory is available before loading LoRA
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        # Set the adapter with the computed weight
-        transformer.set_adapters(adapter_names=["default_lora"], weights=[lora_weight])
-        print(f"Set adapter 'default_lora' with weight {lora_weight}")
+        try:
+            transformer.load_lora_adapter(lora_sd, adapter_name="default_lora")
+            transformer.set_adapters(adapter_names=["default_lora"], weights=[lora_weight])
+            print(f"Set adapter 'default_lora' with weight {lora_weight}")
+        except RuntimeError as e:
+            logger.error(f"Failed to load LoRA adapter: {e}")
+            raise
 
         del lora_sd
         gc.collect()
         torch.cuda.empty_cache()
-
-    transformer = transformer.to(device)
 
     control_latents = None
     if args.control_lora:
@@ -702,31 +672,36 @@ def main(args):
                 image = Image.open(args.control_input).convert("RGB")
                 target_height, target_width = args.height, args.width
                 image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
-                pixels = v2.functional.to_tensor(image)  # C, H, W, range [0, 1]
-                pixels = pixels * 2.0 - 1.0  # Scale to [-1, 1]
-                pixels = pixels.unsqueeze(0).repeat(1, 1, args.num_frames, 1, 1)  # B, C, F, H, W (B=1)
+                pixels = v2.functional.to_tensor(image)
+                pixels = pixels * 2.0 - 1.0
+                pixels = pixels.unsqueeze(0).repeat(1, 1, args.num_frames, 1, 1)
             elif ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
                 vr = decord.VideoReader(args.control_input, height=args.height, width=args.width)
                 indices = np.linspace(0, len(vr) - 1, args.num_frames, dtype=int)
-                frames = vr.get_batch(indices).float()  # F, H, W, C, range [0, 255]
-                pixels = frames.permute(3, 0, 1, 2) / 255.0  # C, F, H, W, range [0, 1]
-                pixels = pixels * 2.0 - 1.0  # Scale to [-1, 1]
-                pixels = pixels.unsqueeze(0)  # B, C, F, H, W (B=1)
+                frames = vr.get_batch(indices).float()
+                pixels = frames.permute(3, 0, 1, 2) / 255.0
+                pixels = pixels * 2.0 - 1.0
+                pixels = pixels.unsqueeze(0)
             else:
                 raise ValueError(f"Unsupported control input file type: {ext}")
 
             pixels = pixels.to(device=device, dtype=torch.float16)
-
             control_pixels = preprocess_control(args, pixels, depth_model, device)
 
+            # Move VAE back to GPU for encoding
+            vae.to(device)
             vae.enable_tiling()
             control_latents = vae.encode(control_pixels).latent_dist.sample() * vae.config.scaling_factor
             control_latents = control_latents.to(transformer.dtype)
-
+            vae.to("cpu")  # Move VAE back to CPU after encoding
             print(f"Control latents generated with shape: {control_latents.shape}")
             del pixels, control_pixels
             gc.collect()
             torch.cuda.empty_cache()
+
+    # Move text encoders back to GPU for pipeline initialization
+    text_encoder_clip.to(device)
+    text_encoder_llama.to(device)
 
     pipe = HunyuanControlLoraPipeline(
         vae=vae,
@@ -760,10 +735,10 @@ def main(args):
         width=args.width,
         num_frames=args.num_frames,
         num_inference_steps=args.inference_steps,
+        guidance_scale=args.guidance_scale,
         generator=generator,
         control_latents=control_latents,
         prompt_template=pipe.DEFAULT_PROMPT_TEMPLATE,
-        # --- Pass Block Swap Args ---
         double_blocks_to_swap=args.double_blocks_swap,
         single_blocks_to_swap=args.single_blocks_swap,
     ).frames[0]
@@ -774,7 +749,6 @@ def main(args):
         fps=24,
     )
     print("Inference complete.")
-
 
 if __name__ == "__main__":
     args = parse_args()
