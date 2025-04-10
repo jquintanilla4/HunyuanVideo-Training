@@ -2,7 +2,7 @@ import os
 import gc
 import argparse
 import torch
-import bitsandbytes as bnb
+import bitsandbytes as bnb # Keep if you might use BNB quantization later
 import numpy as np
 import random
 from PIL import Image
@@ -12,13 +12,13 @@ from contextlib import contextmanager
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from peft import PeftModel, LoraConfig, set_peft_model_state_dict
+from peft import PeftModel, LoraConfig, set_peft_model_state_dict # Keep if using PEFT
 
 from transformers import CLIPTextModel, CLIPTokenizerFast, LlamaModel, LlamaTokenizerFast
 from safetensors.torch import load_file, save_file
 
 from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel, AutoencoderKLHunyuanVideo
-from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
+from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig # Keep if needed
 from diffusers.utils import export_to_video, logging, replace_example_docstring
 from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import retrieve_timesteps
 from diffusers.pipelines.hunyuan_video.pipeline_output import HunyuanVideoPipelineOutput
@@ -65,6 +65,10 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         prompt_template: Dict[str, Any] = None,
         max_sequence_length: int = 256,
+        # --- Block Swap Args ---
+        double_blocks_to_swap: int = 0, # Default to 0 (no swap)
+        single_blocks_to_swap: int = 0, # Default to 0 (no swap)
+        # ---------------------
     ):
         prompt_template = prompt_template if prompt_template is not None else self.DEFAULT_PROMPT_TEMPLATE
 
@@ -96,7 +100,37 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         self._attention_kwargs = attention_kwargs
         self._interrupt = False
 
-        device = self._execution_device
+        main_device = self._execution_device # Use the pipeline's execution device
+        offload_device = torch.device("cpu") # Offload to CPU
+
+        # Validate swap counts
+        max_double_blocks = len(getattr(self.transformer, 'double_blocks', []))
+        max_single_blocks = len(getattr(self.transformer, 'single_blocks', []))
+        double_blocks_to_swap = min(double_blocks_to_swap, max_double_blocks)
+        single_blocks_to_swap = min(single_blocks_to_swap, max_single_blocks)
+
+        if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
+            logger.info(f"Block Swapping Enabled: Swapping {double_blocks_to_swap}/{max_double_blocks} double blocks and {single_blocks_to_swap}/{max_single_blocks} single blocks.")
+            # --- Initial Offload ---
+            try:
+                 logger.info(f"Initial offload to {offload_device}...")
+                 if hasattr(self.transformer, 'double_blocks'):
+                     for i in range(double_blocks_to_swap):
+                         self.transformer.double_blocks[i].to(offload_device)
+                 if hasattr(self.transformer, 'single_blocks'):
+                     for i in range(single_blocks_to_swap):
+                         self.transformer.single_blocks[i].to(offload_device)
+                 gc.collect()
+                 torch.cuda.empty_cache()
+                 logger.info("Initial offload complete.")
+            except Exception as e:
+                logger.error(f"Error during initial block offload: {e}")
+                # Continue without swapping if initial offload fails
+                double_blocks_to_swap = 0
+                single_blocks_to_swap = 0
+        else:
+             logger.info("Block Swapping Disabled.")
+
 
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -113,7 +147,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
-            device=device,
+            device=main_device, # Encode prompts on main device
             max_sequence_length=max_sequence_length,
         )
 
@@ -127,7 +161,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
-            device,
+            main_device, # Timesteps on main device
             sigmas=sigmas,
         )
 
@@ -150,7 +184,7 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 width,
                 num_latent_frames,
                 torch.float32,
-                device,
+                main_device, # Latents on main device
                 generator,
                 latents=None,
             )
@@ -159,8 +193,9 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                   raise ValueError(f"Provided `latents` have {latents.shape[1]} channels, but expected {num_channels_latents} for control model base.")
              elif control_latents is None and latents.shape[1] != num_channels_latents:
                   raise ValueError(f"Provided `latents` have {latents.shape[1]} channels, but expected {num_channels_latents} for standard model.")
-             latents = latents.to(device=device, dtype=torch.float32)
-        guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=device) * 1000.0
+             latents = latents.to(device=main_device, dtype=torch.float32)
+
+        guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=main_device) * 1000.0
 
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -170,14 +205,30 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                 if self.interrupt:
                     continue
 
+                # --- Block Swapping: Move to Main Device ---
+                if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
+                    try:
+                        if hasattr(self.transformer, 'double_blocks'):
+                            for j in range(double_blocks_to_swap):
+                                self.transformer.double_blocks[j].to(main_device)
+                        if hasattr(self.transformer, 'single_blocks'):
+                            for j in range(single_blocks_to_swap):
+                                self.transformer.single_blocks[j].to(main_device)
+                    except Exception as e:
+                        logger.error(f"Error moving blocks to main device at step {i}: {e}")
+                        # Potentially fall back to no swapping or raise error
+
+                # Prepare model input
                 if control_latents is not None:
-                    control_latents_input = control_latents.to(device=device, dtype=transformer_dtype)
+                    control_latents_input = control_latents.to(device=main_device, dtype=transformer_dtype)
                     model_input = torch.cat([latents.to(transformer_dtype), control_latents_input], dim=1)
                 else:
                     model_input = latents.to(transformer_dtype)
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+                timestep = t.expand(latents.shape[0]).to(latents.dtype) # Should already be on main_device
                 timestep = timestep.to(transformer_dtype)
 
+                # Predict noise
                 noise_pred = self.transformer(
                     hidden_states=model_input,
                     timestep=timestep,
@@ -189,8 +240,25 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                     return_dict=False,
                 )[0]
 
+                # --- Block Swapping: Move back to Offload Device ---
+                if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
+                    try:
+                        if hasattr(self.transformer, 'double_blocks'):
+                            for j in range(double_blocks_to_swap):
+                                self.transformer.double_blocks[j].to(offload_device)
+                        if hasattr(self.transformer, 'single_blocks'):
+                            for j in range(single_blocks_to_swap):
+                                self.transformer.single_blocks[j].to(offload_device)
+                        # Optional: Force memory cleanup
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    except Exception as e:
+                        logger.error(f"Error moving blocks to offload device at step {i}: {e}")
+
+                # Scheduler step
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+                # Callbacks
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
@@ -200,9 +268,27 @@ class HunyuanControlLoraPipeline(HunyuanVideoPipeline):
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
+                # Progress bar
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
+        # --- Final Offload (if swapping was enabled) ---
+        if double_blocks_to_swap > 0 or single_blocks_to_swap > 0:
+             try:
+                 logger.info(f"Final offload to {offload_device}...")
+                 if hasattr(self.transformer, 'double_blocks'):
+                     for i in range(double_blocks_to_swap):
+                         self.transformer.double_blocks[i].to(offload_device)
+                 if hasattr(self.transformer, 'single_blocks'):
+                     for i in range(single_blocks_to_swap):
+                         self.transformer.single_blocks[i].to(offload_device)
+                 gc.collect()
+                 torch.cuda.empty_cache()
+                 logger.info("Final offload complete.")
+             except Exception as e:
+                 logger.error(f"Error during final block offload: {e}")
+
+        # Decode latents
         if not output_type == "latent":
             latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
             video = self.vae.decode(latents, return_dict=False)[0]
@@ -318,6 +404,20 @@ def parse_args():
         default="A person typing on a laptop keyboard",
         help="Prompt for inference",
         )
+    # --- Block Swap Args ---
+    parser.add_argument(
+        "--double_blocks_swap",
+        type=int,
+        default=0,
+        help="Number of double transformer blocks to offload to CPU (0 = none)."
+    )
+    parser.add_argument(
+        "--single_blocks_swap",
+        type=int,
+        default=0,
+        help="Number of single transformer blocks to offload to CPU (0 = none)."
+    )
+    # ---------------------
 
     args = parser.parse_args()
 
@@ -325,7 +425,7 @@ def parse_args():
         parser.error("--control_input is required when using --control_lora")
     if args.control_lora and args.lora is None:
          parser.error("--lora checkpoint path is required when using --control_lora")
-    if args.control_lora and DepthAnythingV2 is None:
+    if args.control_lora and args.control_preprocess == "depth" and DepthAnythingV2 is None:
         parser.error("DepthAnythingV2 model could not be imported, cannot use --control_lora with depth preprocessing.")
 
     return args
@@ -433,6 +533,7 @@ def main(args):
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model, subfolder="scheduler")
 
     with timer("Loading Transformer"):
+        # Load initially to main device for modifications/LoRA application
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
             args.pretrained_model,
             subfolder = "transformer",
@@ -523,7 +624,7 @@ def main(args):
         transformer.set_adapters(adapter_names="default_lora", weights=lora_weight)
         print(f"Set adapter 'default_lora' with weight {lora_weight}")
 
-    transformer = transformer.to(device)
+    transformer = transformer.to(device) # Ensure transformer is on main device after LoRA
 
     control_latents = None
     if args.control_lora:
@@ -568,7 +669,7 @@ def main(args):
         text_encoder_2=text_encoder_clip,
         tokenizer_2=tokenizer_clip,
     )
-    pipe = pipe.to(device)
+    pipe = pipe.to(device) # Pipe components should end up on 'device'
     pipe.vae.enable_tiling(
             tile_sample_min_height=256,
             tile_sample_min_width=256,
@@ -593,6 +694,10 @@ def main(args):
         num_inference_steps=args.inference_steps,
         generator=generator,
         control_latents=control_latents,
+        # --- Pass Block Swap Args ---
+        double_blocks_to_swap=args.double_blocks_to_swap,
+        single_blocks_to_swap=args.single_blocks_to_swap,
+        # --------------------------
     ).frames[0]
 
     export_to_video(

@@ -176,6 +176,7 @@ cython_debug/
 # Data folders
 data/*
 models/*
+models_fp8
 outputs/*
 
 # Mac specific files
