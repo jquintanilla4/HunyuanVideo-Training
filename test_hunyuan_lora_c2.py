@@ -1,4 +1,7 @@
 import os
+# Enable expandable segments to reduce memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import gc
 import argparse
 import torch
@@ -116,7 +119,7 @@ class ControlTransformerWrapper(nn.Module):
 
 ### Process Control Video to Generate Control Latents
 def process_control_video(video_path, height, width, num_frames, vae, device, depth_model_path):
-    # Load depth model (adjust based on actual DepthAnythingV2 implementation)
+    # Load depth model
     depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
     depth_model.load_state_dict(torch.load(depth_model_path, map_location='cpu', weights_only=True))
     depth_model = depth_model.to(device)
@@ -157,6 +160,12 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
     # Encode to latents
     with torch.no_grad():
         latents = vae.encode(depth_tensor.unsqueeze(0)).latent_dist.sample() * vae.config.scaling_factor
+    
+    # Clean up depth model
+    del depth_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     return latents  # [1, C, F, H, W]
 
 ### Main Inference Function
@@ -169,10 +178,22 @@ def main(args):
 
     # Load base pipeline
     transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-        args.pretrained_model, subfolder="transformer", torch_dtype=torch.bfloat16
-    ).to(device)
+        args.pretrained_model,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16
+    )
     pipe = HunyuanVideoPipeline.from_pretrained(
-        args.pretrained_model, transformer=transformer, torch_dtype=torch.bfloat16
+        args.pretrained_model,
+        transformer=transformer,
+        torch_dtype=torch.float16
+    )
+    pipe.vae.enable_tiling(
+        tile_sample_min_height=256,
+        tile_sample_min_width=256,
+        tile_sample_min_num_frames=64,
+        tile_sample_stride_height=192,
+        tile_sample_stride_width=192,
+        tile_sample_stride_num_frames=16,
     )
     pipe.enable_sequential_cpu_offload()
 
@@ -189,22 +210,48 @@ def main(args):
     export_to_video(output_base, os.path.join(args.output_dir, "output_base.mp4"), fps=15)
     print("Base model inference completed.")
 
+    # Memory monitoring after base inference
+    print("After base inference:")
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    print(f"Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
+    # Clean up base pipeline
+    del output_base
+    del transformer
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Memory monitoring after cleanup
+    print("After deleting base pipeline:")
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+    print(f"Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+
     # LoRA inference
     if args.lora:
         print("Running LoRA inference...")
-        # Clean up previous transformer
-        del transformer
-        pipe.transformer = None
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Load new transformer
+        # Load new transformer for LoRA
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-            args.pretrained_model, subfolder="transformer", torch_dtype=torch.bfloat16
-        ).to(device)
+            args.pretrained_model,
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16
+        )
+
+        # Memory monitoring after loading new transformer for LoRA
+        print("After loading new transformer for LoRA:")
+        print(f"Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print(f"Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
         control_latents = None
         if args.control_video:
+            # Load VAE for control video processing
+            from diffusers import AutoencoderKLHunyuanVideo
+            vae = AutoencoderKLHunyuanVideo.from_pretrained(
+                args.pretrained_model,
+                subfolder="vae",
+                torch_dtype=torch.bfloat16
+            ).to(device)
+
             # Modify transformer for depth control
             with torch.no_grad():
                 old_proj = transformer.x_embedder.proj
@@ -227,8 +274,24 @@ def main(args):
             # Process control video
             print("Processing control video for depth control...")
             control_latents = process_control_video(
-                args.control_video, args.height, args.width, args.num_frames, pipe.vae, device, args.depth_model_path
+                args.control_video,
+                args.height,
+                args.width,
+                args.num_frames,
+                vae,
+                device,
+                args.depth_model_path
             )
+
+            # Clean up VAE
+            del vae
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Memory monitoring after processing control video
+            print("After processing control video:")
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            print(f"Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
         # Load LoRA weights
         lora_sd = load_file(args.lora)
@@ -239,11 +302,17 @@ def main(args):
         transformer.load_lora_adapter(lora_sd, adapter_name="default_lora")
         transformer.set_adapters(adapter_names="default_lora", weights=lora_weight)
 
-        # Set transformer in pipeline
+        # Load new pipeline for LoRA inference
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            args.pretrained_model,
+            transformer=transformer,
+            torch_dtype=torch.float16
+        )
+        pipe.enable_sequential_cpu_offload()
+
+        # Wrap transformer if using control latents
         if control_latents is not None:
             pipe.transformer = ControlTransformerWrapper(transformer, control_latents)
-        else:
-            pipe.transformer = transformer
 
         # Run LoRA inference
         output_lora = pipe(
