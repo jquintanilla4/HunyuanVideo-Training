@@ -66,34 +66,40 @@ def save_video_to_database(downloaded_db, video_id, video_info, output_dir, forc
     return count
 
 
-def find_best_video_file(video_files, preferred_height=720):
+def find_best_video_file(video_files, preferred_height=720, preferred_width=1280):
     """
     Find the best video file based on resolution preferences
     
     Args:
         video_files (list): List of video file objects from Pexels API
         preferred_height (int): Preferred height in pixels
+        preferred_width (int): Preferred width in pixels
         
     Returns:
         dict or None: The selected video file or None if no suitable file found
     """
     selected_video = None
     
-    # First, try to find exactly preferred height MP4
+    # First, try to find exact match for preferred resolution MP4
     for file in video_files:
         if (file.get("height") == preferred_height and 
+            file.get("width") == preferred_width and
             file.get("file_type") == "video/mp4"):
             selected_video = file
             break
     
-    # If no preferred height, look for closest lower resolution MP4
+    # If no exact match, look for closest resolution MP4
     if not selected_video:
+        closest_diff = float('inf')
         for file in video_files:
-            height = file.get("height")
-            if (height and height <= preferred_height and 
-                file.get("file_type") == "video/mp4"):
-                if not selected_video or height > selected_video.get("height", 0):
+            if file.get("file_type") == "video/mp4":
+                height = file.get("height", 0)
+                width = file.get("width", 0)
+                # Calculate how close this file is to preferred dimensions
+                diff = abs(height - preferred_height) + abs(width - preferred_width)
+                if diff < closest_diff:
                     selected_video = file
+                    closest_diff = diff
     
     # If still no suitable video, use any MP4
     if not selected_video:
@@ -105,14 +111,17 @@ def find_best_video_file(video_files, preferred_height=720):
     return selected_video
 
 
-def download_popular_videos(api_key, total_videos=200, per_page=80, output_dir="pexels_videos"):
+def download_popular_videos(api_key, total_videos=200, per_page=80, preferred_height=720, 
+                            preferred_width=1280, output_dir="pexels_videos"):
     """
-    Download popular videos from Pexels API, prioritizing 720p resolution
+    Download popular videos from Pexels API with specified resolution preferences
     
     Args:
         api_key (str): Your Pexels API key
         total_videos (int): Total number of videos to download
         per_page (int): Number of videos per page (max 80)
+        preferred_height (int): Preferred height in pixels
+        preferred_width (int): Preferred width in pixels
         output_dir (str): Directory to save videos
     """
     # Create output directory if it doesn't exist
@@ -180,7 +189,7 @@ def download_popular_videos(api_key, total_videos=200, per_page=80, output_dir="
                     continue
                 
                 # Find best quality video
-                selected_video = find_best_video_file(video_files)
+                selected_video = find_best_video_file(video_files, preferred_height, preferred_width)
                 
                 if not selected_video:
                     print(f"No suitable video file found for video {video_id}")
@@ -267,6 +276,8 @@ if __name__ == "__main__":
     questions = [
         inquirer.Text('api_key', message='Enter your Pexels API key'),
         inquirer.Text('count', message='Number of videos to download', default='200'),
+        inquirer.Text('height', message='Preferred video height (pixels)', default='720'),
+        inquirer.Text('width', message='Preferred video width (pixels)', default='1280'),
         inquirer.Text('output', message='Output directory', default='data/pexels')
     ]
     
@@ -274,6 +285,8 @@ if __name__ == "__main__":
     
     download_popular_videos(
         answers['api_key'], 
-        int(answers['count']), 
+        int(answers['count']),
+        preferred_height=int(answers['height']),
+        preferred_width=int(answers['width']), 
         output_dir=answers['output']
     )

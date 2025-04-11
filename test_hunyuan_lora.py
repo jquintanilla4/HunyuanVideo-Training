@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type = str,
-        default = "./",
+        default = "./test/test_lora",
         help = "Output directory for results"
         )
     parser.add_argument(
