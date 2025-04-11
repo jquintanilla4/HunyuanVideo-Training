@@ -117,7 +117,7 @@ class ControlTransformerWrapper(nn.Module):
             return_dict=return_dict,
         )
 
-### Process Control Video to Generate Control Latents
+# Process Control Video to Generate Control Latents
 def process_control_video(video_path, height, width, num_frames, vae, device, depth_model_path):
     # Load depth model
     depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
@@ -141,7 +141,7 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
     # Compute depth maps
     depth_maps = []
     for frame in video_array:
-        depth = depth_model.infer_image(frame)  # [H, W], adjust based on actual API
+        depth = depth_model.infer_image(frame).cpu()  # Move tensor to CPU
         depth_maps.append(depth)
     depth_array = np.stack(depth_maps)  # [num_frames, height, width]
 
@@ -155,11 +155,14 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
 
     # Convert to 3 channels for VAE
     depth_array = np.stack([depth_array] * 3, axis=-1)  # [num_frames, height, width, 3]
-    depth_tensor = torch.from_numpy(depth_array).permute(0, 3, 1, 2).float().to(device)  # [num_frames, 3, height, width]
+
+    # Create tensor with float16 dtype and move to device
+    depth_tensor = torch.from_numpy(depth_array).permute(3, 0, 1, 2).to(torch.float16).to(device)  # [3, num_frames, height, width]
+    depth_tensor = depth_tensor.unsqueeze(0)  # [1, 3, num_frames, height, width]
 
     # Encode to latents
     with torch.no_grad():
-        latents = vae.encode(depth_tensor.unsqueeze(0)).latent_dist.sample() * vae.config.scaling_factor
+        latents = vae.encode(depth_tensor).latent_dist.sample() * vae.config.scaling_factor
     
     # Clean up depth model
     del depth_model
