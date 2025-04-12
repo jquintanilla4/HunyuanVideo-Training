@@ -13,77 +13,100 @@ import torch.nn as nn
 from transformers import BitsAndBytesConfig
 from utils.depth_anything_v2.dpt import DepthAnythingV2
 from PIL import Image
+from torchvision.transforms.functional import resize, InterpolationMode
 
 ### Argument Parsing
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="HunyuanVideo LoRA test script with depth control support",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--pretrained_model", type=str, default="./models",
-                        help="Path to pretrained model base directory")
-    parser.add_argument("--lora", type=str, default=None,
-                        help="LoRA file to test")
-    parser.add_argument("--alpha", type=int, default=128,
-                        help="LoRA alpha, defaults to 128")
-    parser.add_argument("--output_dir", type=str, default="./test/test_lora",
-                        help="Output directory for results")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Seed for inference")
-    parser.add_argument("--width", type=int, default=512,
-                        help="Width for inference")
-    parser.add_argument("--height", type=int, default=512,
-                        help="Height for inference")
-    parser.add_argument("--num_frames", type=int, default=33,
-                        help="Number of frames per video, must be divisible by 4+1")
-    parser.add_argument("--inference_steps", type=int, default=20,
-                        help="Number of steps for inference")
-    parser.add_argument("--prompt", type=str, default="A person typing on a laptop keyboard",
-                        help="Prompt for inference")
-    parser.add_argument("--control_video", type=str, default=None,
-                        help="Path to control video for depth control LoRA")
-    parser.add_argument("--depth_model_path", type=str,
-                        default="./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth",
-                        help="Path to DepthAnythingV2 model checkpoint")
-    parser.add_argument("--skip_base_inference",
-                        action="store_true",
-                        help="Skip the base model inference step")
-    args = parser.parse_args()
-    return args
+    parser = argparse.ArgumentParser(description="HunyuanVideo LoRA test script with depth control support")
+    parser.add_argument("--pretrained_model", type=str, default="./models", help="Path to pretrained model base directory")
+    parser.add_argument("--lora", type=str, default=None, help="LoRA file to test")
+    parser.add_argument("--alpha", type=int, default=128, help="LoRA alpha, defaults to 128")
+    parser.add_argument("--output_dir", type=str, default="./test/test_lora", help="Output directory for results")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for inference")
+    parser.add_argument("--width", type=int, default=512, help="Width for inference")
+    parser.add_argument("--height", type=int, default=512, help="Height for inference")
+    parser.add_argument("--num_frames", type=int, default=33, help="Number of frames per video, must be divisible by 4+1")
+    parser.add_argument("--inference_steps", type=int, default=20, help="Number of steps for inference")
+    parser.add_argument("--prompt", type=str, default="A person typing on a laptop keyboard", help="Prompt for inference")
+    parser.add_argument("--control_video", type=str, default=None, help="Path to control video for depth control LoRA")
+    parser.add_argument("--depth_model_path", type=str, default="./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth", help="Path to DepthAnythingV2 model checkpoint")
+    parser.add_argument("--skip_base_inference", action="store_true", help="Skip the base model inference step")
+    return parser.parse_args()
 
 ### Process Control Video to Generate Control Latents
-def process_control_video(video_path, height, width, num_frames, vae, device, depth_model_path):
+def process_control_video(video_path, height, width, num_frames, vae, device, depth_model_path, output_dir):
+    # Load DepthAnythingV2 model
     depth_model = DepthAnythingV2(encoder='vits', features=64, out_channels=[48, 96, 192, 384])
     depth_model.load_state_dict(torch.load(depth_model_path, map_location='cpu', weights_only=True))
     depth_model = depth_model.to(device).eval()
+    depth_model.requires_grad_(False)
 
+    # Load control video
     vr = decord.VideoReader(video_path, ctx=decord.cpu(0))
     total_frames = len(vr)
     frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-    frames = vr.get_batch(frame_indices).asnumpy()
+    frames = vr.get_batch(frame_indices).asnumpy()  # Shape: [num_frames, H, W, 3]
 
+    # Resize frames
     resized_frames = [Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS) for frame in frames]
-    video_array = np.stack([np.array(img) for img in resized_frames])
+    video_array = np.stack([np.array(img) for img in resized_frames])  # Shape: [num_frames, height, width, 3]
 
-    depth_maps = [depth_model.infer_image(frame).cpu() for frame in video_array]
-    del depth_model
-    gc.collect()
-    torch.cuda.empty_cache()
+    # Convert to tensor and normalize to [0, 1]
+    pixels = torch.from_numpy(video_array).permute(0, 3, 1, 2).to(device).float() / 255.0  # Shape: [num_frames, 3, height, width]
+    pixels = pixels.unsqueeze(0)  # Shape: [1, num_frames, 3, height, width]
+    pixels = pixels.permute(0, 2, 1, 3, 4)  # Shape: [1, 3, num_frames, height, width]
 
-    depth_array = np.stack(depth_maps)
-    depth_min, depth_max = depth_array.min(), depth_array.max()
-    if depth_max > depth_min:
-        depth_array = (depth_array - depth_min) / (depth_max - depth_min) * 2 - 1
-    else:
-        depth_array = np.zeros_like(depth_array) - 1
+    # Process depth maps (adapted from training script)
+    B, C, F, H, W = pixels.shape
+    depth_tensor = torch.zeros((B, F, H, W), device=device)
 
-    depth_array = np.stack([depth_array] * 3, axis=-1)
-    depth_tensor = torch.from_numpy(depth_array).permute(3, 0, 1, 2).to(torch.bfloat16).to(device).unsqueeze(0)
+    for b in range(B):
+        for f in range(F):
+            frame = pixels[b, :, f].float() * 0.5 + 0.5  # Normalize to [0, 1]
+            frame = frame.permute(1, 2, 0).cpu().numpy()  # [C, H, W] -> [H, W, C]
 
+            depth = depth_model.infer_image(frame)
+
+            if depth.shape != (H, W):
+                depth_tensor_tmp = torch.tensor(depth, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                depth_tensor_tmp = resize(depth_tensor_tmp, (H, W), interpolation=InterpolationMode.BICUBIC)
+                depth = depth_tensor_tmp.squeeze().cpu().numpy()
+
+            depth_min, depth_max = depth.min(), depth.max()
+            if depth_max > depth_min:
+                depth = (depth - depth_min) / (depth_max - depth_min)
+            depth = depth * 2 - 1  # Scale to [-1, 1]
+
+            depth_tensor[b, f] = torch.tensor(depth, device=device)
+
+    # Save depth maps as a video for inspection
+    print("Saving depth maps as a video for inspection...")
+    depth_normalized = (depth_tensor - depth_tensor.min()) / (depth_tensor.max() - depth_tensor.min()) * 255
+    depth_normalized = depth_normalized.cpu().numpy().astype(np.uint8)  # Shape: [1, num_frames, height, width]
+    depth_normalized = depth_normalized.squeeze(0)  # Shape: [num_frames, height, width]
+    depth_frames = np.stack([depth_normalized] * 3, axis=-1)  # Shape: [num_frames, height, width, 3]
+    depth_video_path = os.path.join(output_dir, "depth_video.mp4")
+    export_to_video(depth_frames, depth_video_path, fps=15)
+    print(f"Depth video saved to {depth_video_path}")
+
+    # Continue with control tensor creation
+    depth_tensor = depth_tensor.unsqueeze(1)  # Shape: [B, 1, F, H, W]
+    control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=vae.dtype)  # Shape: [B, 3, F, H, W]
+
+    # Assertions for control tensor
+    assert control.shape[0] == pixels.shape[0], f"Batch dimension mismatch: {control.shape[0]} vs {pixels.shape[0]}"
+    assert control.shape[2] == pixels.shape[2], f"Frame dimension mismatch: {control.shape[2]} vs {pixels.shape[2]}"
+    assert control.shape[3] == pixels.shape[3], f"Height dimension mismatch: {control.shape[3]} vs {pixels.shape[3]}"
+    assert control.shape[4] == pixels.shape[4], f"Width dimension mismatch: {control.shape[4]} vs {pixels.shape[4]}"
+    assert control.shape[1] == 3, f"Expected control channels to be 3, got {control.shape[1]}"
+    assert not torch.isnan(control).any(), "NaN values detected in control tensor"
+    assert ((control >= -1.0) & (control <= 1.0)).all(), f"Control values out of range [-1,1]: min={control.min().item()}, max={control.max().item()}"
+
+    # Encode control tensor to latents
     with torch.no_grad():
-        latents = vae.encode(depth_tensor).latent_dist.sample() * vae.config.scaling_factor
+        latents = vae.encode(control).latent_dist.sample() * vae.config.scaling_factor
 
-    del depth_tensor
+    del depth_model, control
     gc.collect()
     torch.cuda.empty_cache()
     return latents  # [1, control_channels, F, H', W']
@@ -94,8 +117,10 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Base Inference (Skipped per your args)
-    if not args.skip_base_inference:
+    # Skip Base Inference
+    if args.skip_base_inference:
+        print("Skipping base model inference.")
+    else:
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
             args.pretrained_model, subfolder="transformer", torch_dtype=torch.bfloat16
         )
@@ -107,7 +132,6 @@ def main(args):
             tile_sample_stride_height=192, tile_sample_stride_width=192, tile_sample_stride_num_frames=16,
         )
         pipe.enable_sequential_cpu_offload()
-
         print("Running base model inference...")
         output_base = pipe(
             prompt=args.prompt, height=args.height, width=args.width, num_frames=args.num_frames,
@@ -118,8 +142,6 @@ def main(args):
         del output_base, transformer, pipe
         gc.collect()
         torch.cuda.empty_cache()
-    else:
-        print("Skipping base model inference.")
 
     # LoRA Inference
     if args.lora:
@@ -145,7 +167,7 @@ def main(args):
                 args.pretrained_model, subfolder="vae", torch_dtype=torch.bfloat16
             ).to(device)
             control_latents = process_control_video(
-                args.control_video, args.height, args.width, args.num_frames, vae, device, args.depth_model_path
+                args.control_video, args.height, args.width, args.num_frames, vae, device, args.depth_model_path, args.output_dir
             )
             del vae
             gc.collect()
@@ -266,22 +288,32 @@ def main(args):
         final_latents = latents[:, :original_in_channels, :, :, :].to(pipe.vae.dtype) / pipe.vae.config.scaling_factor
         video_tensor = pipe.vae.decode(final_latents, return_dict=False)[0]
 
-        # Manually postprocess the video tensor
-        # Expected shape: [batch, channels, frames, height, width], e.g., [1, 3, 33, 512, 512]
+        # Debug: Check VAE output
+        print(f"VAE output shape: {video_tensor.shape}, min: {video_tensor.min()}, max: {video_tensor.max()}")
+
+        # Post-process video tensor to fix color inversion
         if video_tensor.dim() == 5:
             # Permute to [batch, frames, height, width, channels]
             video_tensor = video_tensor.permute(0, 2, 3, 4, 1)
-            # Squeeze batch dimension if batch=1
             if video_tensor.shape[0] == 1:
                 video_tensor = video_tensor.squeeze(0)  # [frames, height, width, channels]
             else:
                 raise ValueError(f"Batch size > 1 not handled: {video_tensor.shape}")
-        else:
-            raise ValueError(f"Unexpected video_tensor shape: {video_tensor.shape}")
 
-        # Clamp to [0, 1], scale to [0, 255], and convert to uint8
-        video_tensor = torch.clamp((video_tensor + 1.0) / 2.0, 0, 1)  # Assuming VAE outputs [-1, 1]
+        # Normalize based on actual range to [0, 1]
+        video_min = video_tensor.min()
+        video_max = video_tensor.max()
+        if video_max > video_min:  # Avoid division by zero
+            video_tensor = (video_tensor - video_min) / (video_max - video_min)
+        else:
+            video_tensor = torch.zeros_like(video_tensor)  # Fallback if range is zero
+
+        # Clamp to [0, 1] and scale to [0, 255]
+        video_tensor = torch.clamp(video_tensor, 0, 1)
         video_frames = (video_tensor * 255).to(torch.uint8).cpu().numpy()
+
+        # Debug: Check post-processed frames
+        print(f"Post-processed frames shape: {video_frames.shape}, min: {video_frames.min()}, max: {video_frames.max()}")
 
         # Export to video
         output_path = os.path.join(args.output_dir, "output_lora.mp4")
