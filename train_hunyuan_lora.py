@@ -768,42 +768,45 @@ def main(args):
 
     def preprocess_control(pixels):
         B, C, F, H, W = pixels.shape
-        depth_tensor = torch.zeros((B, F, H, W), device=pixels.device)
+        depth_tensor = torch.zeros((B, F, H, W), device=pixels.device, dtype=torch.float32)
         from torchvision.transforms.functional import resize
         from torchvision.transforms import InterpolationMode
 
         for b in range(B):
             for f in range(F):
-                frame = (pixels[b, :, f].cpu().float() * 0.5 + 0.5).permute(1, 2, 0).numpy()
-                depth = depth_model.infer_image(frame)
-                if depth.shape != (H, W):
-                    d = torch.tensor(depth, device=pixels.device)[None, None]
-                    d = resize(d, (H, W), interpolation=InterpolationMode.BICUBIC)
-                    depth = d.squeeze().cpu().numpy()
+                # extract and de-normalize frame to [0,1]
+                frame = (pixels[b, :, f].float() * 0.5 + 0.5).permute(1, 2, 0).cpu().numpy()
+                depth = depth_model.infer_image(frame)  # returns numpy or tensor
 
-                # Normalize depth to [-1, 1]
+                # ensure tensor on device
+                if not isinstance(depth, torch.Tensor):
+                    depth = torch.from_numpy(depth)
+                depth = depth.to(pixels.device, dtype=torch.float32)
+
+                # resize if shape mismatch
+                if depth.shape != (H, W):
+                    depth = resize(depth.unsqueeze(0).unsqueeze(0),
+                                (H, W),
+                                interpolation=InterpolationMode.BICUBIC
+                                ).squeeze()
+
+                # normalize to [0,1]
                 mi, ma = depth.min(), depth.max()
                 if ma > mi:
                     depth = (depth - mi) / (ma - mi)
-                # depth_tensor[b, f] = torch.tensor(depth * 2 - 1, device=pixels.device)
-                val = (depth * 2 - 1).astype(np.float32)
 
-                # convert from numpy without torch.tensor() to avoid copy-construct warning
-                dep_t = torch.from_numpy(val).to(device=pixels.device)
-                depth_tensor[b, f] = dep_t
+                # shift to [–1,1]
+                depth_tensor[b, f] = depth * 2 - 1
 
         control = depth_tensor.unsqueeze(1).repeat(1, 3, 1, 1, 1).to(vae.dtype)
 
-        # only assert for first N steps
+        # (optional asserts for first few steps)
         if global_step < args.assert_steps:
-            assert control.shape[0] == pixels.shape[0]
-            assert control.shape[2] == pixels.shape[2]
-            assert control.shape[3] == pixels.shape[3]
-            assert control.shape[4] == pixels.shape[4]
             assert not torch.isnan(control).any()
-            assert ((control >= -1) & (control <= 1)).all()
+            assert control.min() >= -1 and control.max() <= 1
 
         return control
+
 
     def prepare_conditions(batch):
         pixels, clip_embed, llama_embed, llama_mask = batch
