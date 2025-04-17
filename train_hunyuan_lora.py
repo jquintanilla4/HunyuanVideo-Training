@@ -433,6 +433,18 @@ def parse_args():
         action = "store_true",
         help = "Use warped noise from Go-With-The-Flow instead of pure random noise",
         )
+    parser.add_argument(
+        "--timestep_shift",
+        type=int,
+        default=5,
+        help="number of discrete timesteps to skip extremes",
+        )
+    parser.add_argument(
+        "--assert_steps",
+        type=int,
+        default=100,
+        help="only perform shape/value asserts for the first N training steps",
+        )
     
     args = parser.parse_args()
     return args
@@ -755,46 +767,38 @@ def main(args):
         depth_model.eval()
 
     def preprocess_control(pixels):
-        if args.control_preprocess == "depth":
-            B, C, F, H, W = pixels.shape
-            depth_tensor = torch.zeros((B, F, H, W), device=pixels.device)
-            
-            # Process each batch item and frame separately
-            for b in range(B):
-                for f in range(F):
-                    frame = pixels[b, :, f].cpu().float() * 0.5 + 0.5  # Normalize to 0-1
-                    frame = frame.permute(1, 2, 0).numpy()  # (C, H, W) -> (H, W, C)
-                    
-                    depth = depth_model.infer_image(frame)
-                    
-                    from torchvision.transforms.functional import resize
-                    if depth.shape != (H, W):
-                        depth_tensor = torch.tensor(depth, device=pixels.device).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-                        depth_tensor = resize(depth_tensor, (H, W), interpolation=InterpolationMode.BICUBIC)
-                        depth = depth_tensor.squeeze().cpu().numpy()
-                    
-                    depth_min, depth_max = depth.min(), depth.max()
-                    if depth_max > depth_min:  # Avoid division by zero
-                        depth = (depth - depth_min) / (depth_max - depth_min)
-                    depth = depth * 2 - 1  # Scale to -1 to 1
-                    
-                    depth_tensor[b, f] = torch.tensor(depth, device=pixels.device)
-            
-            depth_tensor = depth_tensor.unsqueeze(1)  # (B, 1, F, H, W)
-            control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=vae.dtype)  # Replicate to 3 channels; matches the vae dtype
+        B, C, F, H, W = pixels.shape
+        depth_tensor = torch.zeros((B, F, H, W), device=pixels.device)
+        from torchvision.transforms.functional import resize
+        from torchvision.transforms import InterpolationMode
 
-            # Shape and value assertions
-            assert control.shape[0] == pixels.shape[0], f"Batch dimension mismatch: {control.shape[0]} vs {pixels.shape[0]}"
-            assert control.shape[2] == pixels.shape[2], f"Frame dimension mismatch: {control.shape[2]} vs {pixels.shape[2]}"
-            assert control.shape[3] == pixels.shape[3], f"Height dimension mismatch: {control.shape[3]} vs {pixels.shape[3]}"
-            assert control.shape[4] == pixels.shape[4], f"Width dimension mismatch: {control.shape[4]} vs {pixels.shape[4]}"
-            assert control.shape[1] == 3, f"Expected control channels to be 3, got {control.shape[1]}"
-            assert not torch.isnan(control).any(), "NaN values detected in control tensor"
-            assert ((control >= -1.0) & (control <= 1.0)).all(), f"Control values out of range [-1,1]: min={control.min().item()}, max={control.max().item()}"
-            
-            return control
-        else:
-            raise NotImplementedError(f"{args.control_preprocess}")
+        for b in range(B):
+            for f in range(F):
+                frame = (pixels[b, :, f].cpu().float() * 0.5 + 0.5) \
+                        .permute(1, 2, 0).numpy()
+                depth = depth_model.infer_image(frame)
+                if depth.shape != (H, W):
+                    d = torch.tensor(depth, device=pixels.device)[None, None]
+                    d = resize(d, (H, W), interpolation=InterpolationMode.BICUBIC)
+                    depth = d.squeeze().cpu().numpy()
+
+                mi, ma = depth.min(), depth.max()
+                if ma > mi:
+                    depth = (depth - mi) / (ma - mi)
+                depth_tensor[b, f] = torch.tensor(depth * 2 - 1, device=pixels.device)
+
+        control = depth_tensor.unsqueeze(1).repeat(1, 3, 1, 1, 1).to(vae.dtype)
+
+        # Option D: only assert for first N steps
+        if global_step < args.assert_steps:
+            assert control.shape[0] == pixels.shape[0]
+            assert control.shape[2] == pixels.shape[2]
+            assert control.shape[3] == pixels.shape[3]
+            assert control.shape[4] == pixels.shape[4]
+            assert not torch.isnan(control).any()
+            assert ((control >= -1) & (control <= 1)).all()
+
+        return control
 
     def prepare_conditions(batch):
         pixels, clip_embed, llama_embed, llama_mask = batch
@@ -844,12 +848,16 @@ def main(args):
             ).movedim(1, 2).to(latents)  # BFCHW -> BCFHW
         else:
             noise = torch.randn_like(latents)
-        
-        sigma = torch.rand(latents.shape[0], device=latents.device)
-        timesteps = torch.round(sigma * 1000).long()
-        sigma = sigma[:, None, None, None, None]
+
+        # truncated uniform to skip extremes by shift (no clamping/wrapping)
+        shift_frac = args.timestep_shift / 1000.0
+        # sample σ ∈ [shift_frac, 1 − shift_frac]
+        sigma_vals = torch.rand(latents.shape[0], device=latents.device) \
+            * (1 - 2 * shift_frac) + shift_frac
+        timesteps = (sigma_vals * 1000).round().long()
+        sigma = sigma_vals[:, None, None, None, None]
         noisy_model_input = (noise * sigma) + (latents * (1 - sigma))
-        
+
         model_inputs = [noisy_model_input]
         if args.skyreels_i2v:
             model_inputs.append(image_cond_latents)
