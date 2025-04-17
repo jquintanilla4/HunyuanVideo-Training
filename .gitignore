@@ -189,3 +189,4 @@ test/source_videos/*
 test/test_control/*
 test/test_base/*
 test/test_lora/*
+temp_data_placement/

@@ -774,22 +774,27 @@ def main(args):
 
         for b in range(B):
             for f in range(F):
-                frame = (pixels[b, :, f].cpu().float() * 0.5 + 0.5) \
-                        .permute(1, 2, 0).numpy()
+                frame = (pixels[b, :, f].cpu().float() * 0.5 + 0.5).permute(1, 2, 0).numpy()
                 depth = depth_model.infer_image(frame)
                 if depth.shape != (H, W):
                     d = torch.tensor(depth, device=pixels.device)[None, None]
                     d = resize(d, (H, W), interpolation=InterpolationMode.BICUBIC)
                     depth = d.squeeze().cpu().numpy()
 
+                # Normalize depth to [-1, 1]
                 mi, ma = depth.min(), depth.max()
                 if ma > mi:
                     depth = (depth - mi) / (ma - mi)
-                depth_tensor[b, f] = torch.tensor(depth * 2 - 1, device=pixels.device)
+                # depth_tensor[b, f] = torch.tensor(depth * 2 - 1, device=pixels.device)
+                val = (depth * 2 - 1).astype(np.float32)
+
+                # convert from numpy without torch.tensor() to avoid copy-construct warning
+                dep_t = torch.from_numpy(val).to(device=pixels.device)
+                depth_tensor[b, f] = dep_t
 
         control = depth_tensor.unsqueeze(1).repeat(1, 3, 1, 1, 1).to(vae.dtype)
 
-        # Option D: only assert for first N steps
+        # only assert for first N steps
         if global_step < args.assert_steps:
             assert control.shape[0] == pixels.shape[0]
             assert control.shape[2] == pixels.shape[2]
@@ -805,18 +810,18 @@ def main(args):
         pixels = pixels.to(device=vae.device, dtype=vae.dtype)  # BCFHW
         latents = vae.encode(pixels).latent_dist.sample() * vae.config.scaling_factor
 
-        print(f"DEBUG: Input pixels shape: {pixels.shape}")
-        print(f"DEBUG: Encoded latents shape: {latents.shape}")
+        # print(f"DEBUG: Input pixels shape: {pixels.shape}") # DEBUG only
+        # print(f"DEBUG: Encoded latents shape: {latents.shape}") # DEBUG only
         
         if args.control_lora:
             control = preprocess_control(pixels)
-            print(f"DEBUG: Control shape: {control.shape}")
+            # print(f"DEBUG: Control shape: {control.shape}") # DEBUG only
             
             assert control.shape[2:] == pixels.shape[2:], f"Control shape {control.shape[2:]} doesn't match input shape {pixels.shape[2:]}"
             
             try:
                 control_latents = vae.encode(control).latent_dist.sample() * vae.config.scaling_factor
-                print(f"DEBUG: Control latents shape: {control_latents.shape}")
+                # print(f"DEBUG: Control latents shape: {control_latents.shape}") # DEBUG only
                 
                 assert control_latents.shape == latents.shape, f"Shape mismatch: control latents {control_latents.shape} vs. latents {latents.shape}"
                 
@@ -865,7 +870,7 @@ def main(args):
             model_inputs.append(control_latents)
 
         noisy_model_input = torch.cat(model_inputs, dim=1)
-        print(f"DEBUG: Final model input shape: {noisy_model_input.shape}")
+        # print(f"DEBUG: Final model input shape: {noisy_model_input.shape}") # DEBUG only
 
         assert noisy_model_input.ndim == 5, f"Model input should be 5D but got shape {noisy_model_input.shape}"
         if args.control_lora:
