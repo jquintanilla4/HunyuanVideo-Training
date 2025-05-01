@@ -14,6 +14,7 @@ from transformers import BitsAndBytesConfig
 from utils.depth_anything_v2.dpt import DepthAnythingV2
 from PIL import Image
 from torchvision.transforms.functional import resize, InterpolationMode
+from torchvision.transforms import InterpolationMode
 
 
 ### Argument Parsing
@@ -45,7 +46,7 @@ def parse_args():
                         help="Height for inference")
     parser.add_argument("--num_frames", type=int,
                         default=33,
-                        help="Number of frames per video, must be divisible by 4+1")
+                        help="Number of frames per video, must be divisible by 4+1") # math term: N ≡ 1 (mod 4); formula: n = 4k + 1
     parser.add_argument("--inference_steps", type=int,
                         default=20,
                         help="Number of steps for inference")
@@ -88,57 +89,83 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
     resized_frames = [Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS) for frame in frames]
     video_array = np.stack([np.array(img) for img in resized_frames])  # [num_frames, H, W, 3]
 
-    # Convert to tensor and normalize to [0, 1]
-    pixels = torch.from_numpy(video_array).permute(0, 3, 1, 2).to(device).float() / 255.0
+    # Convert to tensor and normalize to [-1, 1] for VAE input compatibility (as done in training datasets)
+    pixels = torch.from_numpy(video_array).permute(0, 3, 1, 2).to(device).float() / 127.5 - 1.0
     pixels = pixels.unsqueeze(0)        # [1, num_frames, 3, H, W]
     pixels = pixels.permute(0, 2, 1, 3, 4)  # [1, 3, num_frames, H, W]
 
-    # Process depth maps (adapted from training script)
+    # Process depth maps (aligned with training script logic)
     B, C, F, H, W = pixels.shape
-    depth_tensor = torch.zeros((B, F, H, W), device=device)
+    depth_tensor = torch.zeros((B, F, H, W), device=device, dtype=torch.float32)
+
     for b in range(B):
         for f in range(F):
-            frame = pixels[b, :, f].float() * 0.5 + 0.5  # Normalize to [0, 1]
-            frame = frame.permute(1, 2, 0).cpu().numpy()   # [H, W, C]
-            depth = depth_model.infer_image(frame)
+            # Extract and de-normalize frame to [0,1] for depth model
+            frame = (pixels[b, :, f].float() * 0.5 + 0.5).permute(1, 2, 0).cpu().numpy()
+            depth = depth_model.infer_image(frame)  # returns numpy or tensor
+
+            # Ensure tensor on device
+            if not isinstance(depth, torch.Tensor):
+                depth = torch.from_numpy(depth)
+            depth = depth.to(pixels.device, dtype=torch.float32)
+
+            # Resize if shape mismatch
             if depth.shape != (H, W):
-                depth_tensor_tmp = torch.tensor(depth, device=device).unsqueeze(0).unsqueeze(0)
-                depth_tensor_tmp = resize(depth_tensor_tmp, (H, W), interpolation=InterpolationMode.BICUBIC)
-                depth = depth_tensor_tmp.squeeze().cpu().numpy()
-            depth_min, depth_max = depth.min(), depth.max()
-            if depth_max > depth_min:
-                depth = (depth - depth_min) / (depth_max - depth_min)
-            depth = depth * 2 - 1  # Scale to roughly [-1, 1]
-            depth_tensor[b, f] = torch.tensor(depth, device=device)
-    
-    # Save depth maps as a video for inspection
+                depth = resize(depth.unsqueeze(0).unsqueeze(0),
+                               (H, W),
+                               interpolation=InterpolationMode.BICUBIC
+                               ).squeeze()
+
+            # Normalize to [0,1]
+            mi, ma = depth.min(), depth.max()
+            if ma > mi:
+                depth = (depth - mi) / (ma - mi)
+
+            # Shift to [-1,1]
+            depth_tensor[b, f] = depth * 2.0 - 1.0
+
+    # Save depth maps as a video for inspection (using the [-1, 1] range)
     print("Saving depth maps as a video for inspection...")
-    depth_normalized = (depth_tensor - depth_tensor.min()) / (depth_tensor.max() - depth_tensor.min()) * 255
-    depth_normalized = depth_normalized.cpu().numpy().astype(np.uint8)  # [1, frames, H, W]
-    depth_normalized = depth_normalized.squeeze(0)  # [frames, H, W]
-    depth_frames = np.stack([depth_normalized] * 3, axis=-1)  # [frames, H, W, 3]
-    
+    # Normalize depth_tensor from [-1, 1] to [0, 255] for video saving
+    depth_display = ((depth_tensor + 1.0) / 2.0 * 255.0).clamp(0, 255)
+    depth_display = depth_display.cpu().numpy().astype(np.uint8) # [B, F, H, W]
+    if depth_display.shape[0] == 1:
+        depth_display = depth_display.squeeze(0) # [F, H, W]
+    else:
+        # Handle batch > 1 if necessary, maybe save separate videos or tile them
+        print(f"Warning: Batch size {depth_display.shape[0]} > 1, saving only the first item's depth.")
+        depth_display = depth_display[0]
+
+    # Ensure it's 3 channels for video export
+    if depth_display.ndim == 3: # [F, H, W]
+         depth_frames_display = np.stack([depth_display] * 3, axis=-1) # [F, H, W, 3]
+    else:
+         # Handle unexpected dimensions if necessary
+         raise ValueError(f"Unexpected depth_display dimensions: {depth_display.shape}")
+
     depth_video_path = os.path.join(output_dir, "depth_video.mp4")
-    export_to_video(depth_frames, depth_video_path, fps=fps)
+    export_to_video(depth_frames_display, depth_video_path, fps=fps)
     print(f"Depth video saved to {depth_video_path}")
 
     # Create control latents: replicate depth map to 3 channels.
     depth_tensor = depth_tensor.unsqueeze(1)  # [B, 1, F, H, W]
     control = depth_tensor.repeat(1, 3, 1, 1, 1).to(dtype=vae.dtype)
-    
-    # Check shape consistency
+
+    # Check shape consistency and range
     assert control.shape[0] == pixels.shape[0]
-    assert control.shape[2] == pixels.shape[2]
-    assert control.shape[3] == pixels.shape[3]
-    assert control.shape[4] == pixels.shape[4]
-    assert control.shape[1] == 3
+    assert control.shape[2] == pixels.shape[2] # F
+    assert control.shape[3] == pixels.shape[3] # H
+    assert control.shape[4] == pixels.shape[4] # W
+    assert control.shape[1] == 3 # Channels
     assert not torch.isnan(control).any()
-    assert ((control >= -1.0) & (control <= 1.0)).all()
+    # Use a small epsilon for float comparisons
+    assert (control >= -1.0 - 1e-6).all() and (control <= 1.0 + 1e-6).all(), f"Control range error: min={control.min()}, max={control.max()}"
+    # Verify that the depth map preprocessing resulted in values within the expected [-1, 1] bounds 
 
     with torch.no_grad():
         latents = vae.encode(control).latent_dist.sample() * vae.config.scaling_factor
 
-    del depth_model, control
+    del depth_model, control, pixels, depth_tensor # Clean up tensors
     gc.collect()
     torch.cuda.empty_cache()
     return latents  # [1, control_channels, F, H', W']
@@ -261,7 +288,7 @@ def main(args):
         batch_size = 1
         num_videos_per_prompt = 1
         generator = torch.Generator(device=device).manual_seed(args.seed)
-        guidance_scale = 6.0
+        guidance_scale = 3.0
 
         prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = pipe.encode_prompt(prompt=args.prompt,
                                                                                         num_videos_per_prompt=num_videos_per_prompt,
