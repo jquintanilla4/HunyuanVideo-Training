@@ -15,6 +15,7 @@ from utils.depth_anything_v2.dpt import DepthAnythingV2
 from PIL import Image
 from torchvision.transforms.functional import resize, InterpolationMode
 from torchvision.transforms import InterpolationMode
+from tqdm import tqdm
 
 
 ### Argument Parsing
@@ -32,6 +33,12 @@ def parse_args():
     parser.add_argument("--lora_weight", type=float,
                         default=None,
                         help="Override the computed LoRA weight if provided")
+    parser.add_argument("--guidance_scale", type=float,
+                        default=6.0,
+                        help="Guidance scale for LoRA inference, aka CFG")
+    parser.add_argument("--control_scale", type=float,
+                        default=1.0,
+                        help="Scale for control latents")
     parser.add_argument("--output_dir", type=str,
                         default="./test/test_lora",
                         help="Output directory for results")
@@ -124,24 +131,21 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
             # Shift to [-1,1]
             depth_tensor[b, f] = depth * 2.0 - 1.0
 
-    # Save depth maps as a video for inspection (using the [-1, 1] range)
+    # Save depth maps as a video for inspection
     print("Saving depth maps as a video for inspection...")
-    # Normalize depth_tensor from [-1, 1] to [0, 255] for video saving
-    depth_display = ((depth_tensor + 1.0) / 2.0 * 255.0).clamp(0, 255)
-    depth_display = depth_display.cpu().numpy().astype(np.uint8) # [B, F, H, W]
+    depth_visual = (-depth_tensor + 1.0) / 2.0  # [0,1] with 1 being close, 0 being far
+    depth_display = (depth_visual * 255.0).clamp(0, 255).cpu().numpy().astype(np.uint8)  # [B, F, H, W]
     if depth_display.shape[0] == 1:
-        depth_display = depth_display.squeeze(0) # [F, H, W]
+        depth_display = depth_display.squeeze(0)  # [F, H, W]
     else:
-        # Handle batch > 1 if necessary, maybe save separate videos or tile them
         print(f"Warning: Batch size {depth_display.shape[0]} > 1, saving only the first item's depth.")
         depth_display = depth_display[0]
 
     # Ensure it's 3 channels for video export
-    if depth_display.ndim == 3: # [F, H, W]
-         depth_frames_display = np.stack([depth_display] * 3, axis=-1) # [F, H, W, 3]
+    if depth_display.ndim == 3:  # [F, H, W]
+        depth_frames_display = np.stack([depth_display] * 3, axis=-1)  # [F, H, W, 3]
     else:
-         # Handle unexpected dimensions if necessary
-         raise ValueError(f"Unexpected depth_display dimensions: {depth_display.shape}")
+        raise ValueError(f"Unexpected depth_display dimensions: {depth_display.shape}")
 
     depth_video_path = os.path.join(output_dir, "depth_video.mp4")
     export_to_video(depth_frames_display, depth_video_path, fps=fps)
@@ -171,6 +175,38 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
     return latents  # [1, control_channels, F, H', W']
 
 
+def get_control_scale(t, total_timesteps, max_scale=2.0):
+    """
+    Compute the control scale for a given timestep during the denoising process.
+
+    Args:
+        t (int or float): The current timestep (should be in [0, total_timesteps]).
+        total_timesteps (int or float): The total number of timesteps in the denoising process.
+        max_scale (float, optional): The maximum control scale to apply at timestep 0. Default is 2.0.
+
+    Returns:
+        float: The control scale for the current timestep, linearly decreasing from max_scale to 0.
+    """
+    scale = max_scale * (1 - t / total_timesteps)
+    return scale
+
+
+def get_reverse_control_scale(t, total_timesteps, max_scale=2.0):
+    """
+    Compute the reverse control scale for a given timestep during the denoising process.
+
+    Args:
+        t (int or float): The current timestep (should be in [0, total_timesteps]).
+        total_timesteps (int or float): The total number of timesteps in the denoising process.
+        max_scale (float, optional): The maximum control scale to apply at timestep 0. Default is 2.0.
+
+    Returns:
+        float: The reverse control scale for the current timestep, linearly increasing from 0 to max_scale.
+    """
+    reverse_scale = max_scale * (t / total_timesteps) # scale = 2.0 * (i / total_timesteps)
+    return reverse_scale
+
+
 ### Main Inference Function
 @torch.inference_mode()
 def main(args):
@@ -181,15 +217,15 @@ def main(args):
     if args.skip_base_inference:
         print("Skipping base model inference.")
     else:
-        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-            args.pretrained_model, subfolder="transformer", torch_dtype=torch.bfloat16
-        )
-        pipe = HunyuanVideoPipeline.from_pretrained(
-            args.pretrained_model, transformer=transformer, torch_dtype=torch.float16
-        )
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(args.pretrained_model, subfolder="transformer", torch_dtype=torch.bfloat16)
+        pipe = HunyuanVideoPipeline.from_pretrained(args.pretrained_model, transformer=transformer, torch_dtype=torch.float16)
         pipe.vae.enable_tiling(
-            tile_sample_min_height=256, tile_sample_min_width=256, tile_sample_min_num_frames=64,
-            tile_sample_stride_height=192, tile_sample_stride_width=192, tile_sample_stride_num_frames=16,
+            tile_sample_min_height=256,
+            tile_sample_min_width=256,
+            tile_sample_min_num_frames=64,
+            tile_sample_stride_height=192,
+            tile_sample_stride_width=192,
+            tile_sample_stride_num_frames=16,
         )
         pipe.enable_sequential_cpu_offload()
         print("Running base model inference...")
@@ -271,9 +307,7 @@ def main(args):
         transformer.load_lora_adapter(lora_sd, adapter_name="default_lora")
         transformer.set_adapters(adapter_names="default_lora", weights=lora_weight)
 
-        pipe = HunyuanVideoPipeline.from_pretrained(
-            args.pretrained_model, transformer=transformer, torch_dtype=torch.float16
-        )
+        pipe = HunyuanVideoPipeline.from_pretrained(args.pretrained_model, transformer=transformer, torch_dtype=torch.float16)
         pipe.vae.enable_tiling(
             tile_sample_min_height=128,
             tile_sample_min_width=128,
@@ -288,7 +322,7 @@ def main(args):
         batch_size = 1
         num_videos_per_prompt = 1
         generator = torch.Generator(device=device).manual_seed(args.seed)
-        guidance_scale = 3.0
+        guidance_scale = args.guidance_scale
 
         prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = pipe.encode_prompt(prompt=args.prompt,
                                                                                         num_videos_per_prompt=num_videos_per_prompt,
@@ -323,7 +357,7 @@ def main(args):
         guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=device) * 1000.0
 
         print("Starting denoising loop...")
-        for i, t in enumerate(timesteps):
+        for i, t in tqdm(enumerate(timesteps), total=len(timesteps), desc="Denoising"):
             latent_model_input = latents.to(transformer_dtype)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
@@ -337,11 +371,22 @@ def main(args):
                 return_dict=False,
             )[0]
 
+            # Split latents into original and control parts
             original_latents = latents[:, :original_in_channels, :, :, :]
             control_latents_part = latents[:, original_in_channels:, :, :, :]
 
+            # Denoise/update original latents
             updated_latents = pipe.scheduler.step(noise_pred, t, original_latents, return_dict=False)[0]
 
+            # Timestep-dependent control scale
+            total_timesteps = len(timesteps)
+            scale = get_control_scale(i, total_timesteps, max_scale=args.control_scale) # control scale, max_scale -> 0.0
+            # scale = get_reverse_control_scale(i, total_timesteps, max_scale=args.control_scale) # reverse control scale, 0.0 -> max_scale
+            control_latents_part = control_latents_part * scale
+
+            # Constant scale
+            # control_latents_part = control_latents_part * args.control_scale # Try 0.5, 1.5, 2.0
+            
             latents = torch.cat([updated_latents, control_latents_part], dim=1)
 
         print("Decoding latents with VAE...")
