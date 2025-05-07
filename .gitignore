@@ -181,6 +181,7 @@ outputs/*
 
 # Mac specific files
 .DS_Store
+.vscode/
 
 # Project specific files
 legacy/

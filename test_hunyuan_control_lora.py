@@ -37,8 +37,11 @@ def parse_args():
                         default=6.0,
                         help="Guidance scale for LoRA inference, aka CFG")
     parser.add_argument("--control_scale", type=float,
-                        default=1.0,
-                        help="Scale for control latents")
+                        default=None,
+                        help="Max dynamic scale for control latents (uses schedule if set)")
+    parser.add_argument("--constant", type=float,
+                        default=None,
+                        help="Constant scale for control latents (overrides dynamic)")
     parser.add_argument("--output_dir", type=str,
                         default="./test/test_lora",
                         help="Output directory for results")
@@ -354,7 +357,8 @@ def main(args):
             control_latents = control_latents.to(latents.device, latents.dtype)
             latents[:, original_in_channels:, :, :, :] = control_latents
 
-        guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=device) * 1000.0
+        # guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=device) * 1000.0
+        guidance = torch.tensor([guidance_scale] * latents.shape[0], dtype=transformer_dtype, device=device)
 
         print("Starting denoising loop...")
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps), desc="Denoising"):
@@ -380,13 +384,14 @@ def main(args):
 
             # Timestep-dependent control scale
             total_timesteps = len(timesteps)
-            scale = get_control_scale(i, total_timesteps, max_scale=args.control_scale) # control scale, max_scale -> 0.0
-            # scale = get_reverse_control_scale(i, total_timesteps, max_scale=args.control_scale) # reverse control scale, 0.0 -> max_scale
+            if args.control_scale is not None:
+                scale = get_control_scale(i, total_timesteps, max_scale=args.control_scale)
+            elif args.constant is not None:
+                scale = args.constant
+            else:
+                scale = 1.0
             control_latents_part = control_latents_part * scale
 
-            # Constant scale
-            # control_latents_part = control_latents_part * args.control_scale # Try 0.5, 1.5, 2.0
-            
             latents = torch.cat([updated_latents, control_latents_part], dim=1)
 
         print("Decoding latents with VAE...")
