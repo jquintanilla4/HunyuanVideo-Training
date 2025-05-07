@@ -1,24 +1,24 @@
+import random
+from tqdm import tqdm
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import resize, InterpolationMode
+from PIL import Image
+from utils.depth_anything_v2.dpt import DepthAnythingV2
+from transformers import BitsAndBytesConfig
+import torch.nn as nn
+import numpy as np
+import decord
+from diffusers.utils import export_to_video
+from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel
+from safetensors.torch import load_file
+import torch
+import argparse
+import gc
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import gc
-import argparse
-import torch
-from safetensors.torch import load_file
-from diffusers import HunyuanVideoPipeline, HunyuanVideoTransformer3DModel
-from diffusers.utils import export_to_video
-import decord
-import numpy as np
-import torch.nn as nn
-from transformers import BitsAndBytesConfig
-from utils.depth_anything_v2.dpt import DepthAnythingV2
-from PIL import Image
-from torchvision.transforms.functional import resize, InterpolationMode
-from torchvision.transforms import InterpolationMode
-from tqdm import tqdm
 
-
-### Argument Parsing
+# Argument Parsing
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanVideo LoRA test script with depth control support")
     parser.add_argument("--pretrained_model", type=str,
@@ -28,7 +28,7 @@ def parse_args():
                         default=None,
                         help="LoRA file to test")
     parser.add_argument("--alpha", type=int,
-                        default=128, 
+                        default=128,
                         help="LoRA alpha, defaults to 128")
     parser.add_argument("--lora_weight", type=float,
                         default=None,
@@ -56,7 +56,7 @@ def parse_args():
                         help="Height for inference")
     parser.add_argument("--num_frames", type=int,
                         default=33,
-                        help="Number of frames per video, must be divisible by 4+1") # math term: N ≡ 1 (mod 4); formula: n = 4k + 1
+                        help="Number of frames per video, must be divisible by 4+1")  # math term: N ≡ 1 (mod 4); formula: n = 4k + 1
     parser.add_argument("--inference_steps", type=int,
                         default=20,
                         help="Number of steps for inference")
@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument("--depth_model_path", type=str,
                         default="./models/Depth-Anything-V2-Small/depth_anything_v2_vits.pth",
                         help="Path to DepthAnythingV2 model checkpoint")
-    parser.add_argument("--skip_base_inference", 
+    parser.add_argument("--skip_base_inference",
                         action="store_true",
                         help="Skip the base model inference step")
     # Flag to swap channels if needed (e.g., BGR -> RGB).
@@ -167,7 +167,7 @@ def process_control_video(video_path, height, width, num_frames, vae, device, de
     assert not torch.isnan(control).any()
     # Use a small epsilon for float comparisons
     assert (control >= -1.0 - 1e-6).all() and (control <= 1.0 + 1e-6).all(), f"Control range error: min={control.min()}, max={control.max()}"
-    # Verify that the depth map preprocessing resulted in values within the expected [-1, 1] bounds 
+    # Verify that the depth map preprocessing resulted in values within the expected [-1, 1] bounds
 
     with torch.no_grad():
         latents = vae.encode(control).latent_dist.sample() * vae.config.scaling_factor
@@ -213,6 +213,17 @@ def get_reverse_control_scale(t, total_timesteps, max_scale=2.0):
 ### Main Inference Function
 @torch.inference_mode()
 def main(args):
+    def set_all_seeds(seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
+
+    # ensure full reproducibility
+    set_all_seeds(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -236,7 +247,7 @@ def main(args):
             prompt=args.prompt, height=args.height, width=args.width, num_frames=args.num_frames,
             num_inference_steps=args.inference_steps, generator=torch.Generator(device=device).manual_seed(args.seed)
         ).frames[0]
-        
+
         export_to_video(output_base, os.path.join(args.output_dir, "output_base.mp4"), fps=args.fps)
         print("Base model inference completed.")
         del output_base, transformer, pipe
@@ -250,12 +261,12 @@ def main(args):
         print("Loading and quantizing transformer...")
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(args.pretrained_model,
                                                                      subfolder="transformer",
-                                                                     quantization_config=quant_config, 
+                                                                     quantization_config=quant_config,
                                                                      torch_dtype=torch.bfloat16)
-        
+
         print(f"After loading transformer: Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB, "
               f"Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
-        
+
         control_latents = None
         original_in_channels = transformer.config.in_channels  # e.g. 16
 
@@ -321,6 +332,10 @@ def main(args):
         )
         pipe.enable_sequential_cpu_offload()
 
+        # disable dropout/randomness
+        transformer.eval()
+        pipe.vae.eval()
+
         # Custom Pipeline Logic
         batch_size = 1
         num_videos_per_prompt = 1
@@ -352,7 +367,7 @@ def main(args):
             device=device,
             dtype=torch.float32,
             generator=generator)
-        
+
         if control_latents is not None:
             control_latents = control_latents.to(latents.device, latents.dtype)
             latents[:, original_in_channels:, :, :, :] = control_latents
@@ -407,7 +422,7 @@ def main(args):
                 video_tensor = video_tensor.squeeze(0)  # [F, H, W, C]
             else:
                 raise ValueError(f"Batch size > 1 not handled: {video_tensor.shape}")
-        
+
         # Convert from roughly [-1, 1] to [0, 1]
         video_tensor = (video_tensor + 1.0) / 2.0
         # Permanently flip colors.
@@ -416,7 +431,7 @@ def main(args):
         # Optionally swap channels if needed.
         if args.swap_channels:
             video_tensor = video_tensor[..., [2, 1, 0]]
-        
+
         # Clamp values to valid range [0,1] before converting to uint8
         video_tensor = torch.clamp(video_tensor, 0.0, 1.0)
         # Scale to [0,255], round to integers, convert to uint8, move to CPU, and convert to numpy
