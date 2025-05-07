@@ -904,7 +904,7 @@ def main(args):
                 return_dict = False,
             )[0]
 
-        original_channels = diffusion_model.config.in_channels // 2 # Since new_in_dim is registered
+        original_channels = diffusion_model.config.in_channels // 2 # Since new_in_dim is registered; depth control LoRA
         loss = F.mse_loss(pred[:, :original_channels].float(), conditions["target"].float())
         # loss = F.mse_loss(pred.float(), conditions["target"].float())
         assert not torch.isnan(pred).any(), "NaN detected in predictions"
